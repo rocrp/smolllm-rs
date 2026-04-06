@@ -1,0 +1,36 @@
+use smolllm;
+use tokio_stream::StreamExt;
+
+#[tokio::main]
+async fn main() -> Result<(), smolllm::Error> {
+    env_logger::init();
+    let _ = dotenvy::from_filename(
+        dirs_next::home_dir()
+            .expect("no home dir")
+            .join(".env.smolllm"),
+    );
+
+    let mut stream = smolllm::stream("Explain async/await in Rust in 3 sentences.")
+        .model("gemini/gemini-flash-lite-latest")
+        .system_prompt("Be concise and technical.")
+        .await?;
+
+    print!("Response: ");
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        print!("{}", chunk.content);
+    }
+    println!();
+
+    if !stream.reasoning.is_empty() {
+        println!("\nReasoning: {}", stream.reasoning);
+    }
+
+    let usage = stream.usage();
+    println!(
+        "Tokens: {} in / {} out, Duration: {:?}",
+        usage.input_tokens, usage.output_tokens, usage.duration
+    );
+
+    Ok(())
+}

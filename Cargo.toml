@@ -1,0 +1,38 @@
+[package]
+name = "smolllm"
+version = "0.1.0"
+edition = "2021"
+description = "A tiny, ergonomic Rust client for OpenAI-compatible LLM APIs"
+license = "MIT"
+rust-version = "1.80"
+
+[dependencies]
+reqwest = { version = "0.12", features = ["stream", "json"] }
+tokio = { version = "1", features = ["time", "sync", "rt"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+thiserror = "2"
+base64 = "0.22"
+rand = "0.9"
+futures-core = "0.3"
+tokio-stream = "0.1"
+bytes = "1"
+
+[dev-dependencies]
+env_logger = "0.11"
+dotenvy = "0.15"
+tokio = { version = "1", features = ["full"] }
+dirs-next = "2.0.0"
+
+[[example]]
+name = "ask"
+path = "examples/ask.rs"
+
+[[example]]
+name = "stream"
+path = "examples/stream.rs"
+
+[[example]]
+name = "e2e"
+path = "examples/e2e.rs"
