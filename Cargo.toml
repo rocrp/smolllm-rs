@@ -26,8 +26,8 @@ tokio = { version = "1", features = ["full"] }
 dirs-next = "2.0.0"
 
 [[example]]
-name = "ask"
-path = "examples/ask.rs"
+name = "simple"
+path = "examples/simple.rs"
 
 [[example]]
 name = "stream"
