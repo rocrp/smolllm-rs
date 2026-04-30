@@ -34,19 +34,31 @@ pub struct Message {
 
 impl Message {
     pub fn system(content: impl Into<String>) -> Self {
-        Self { role: MessageRole::System, content: content.into() }
+        Self {
+            role: MessageRole::System,
+            content: content.into(),
+        }
     }
 
     pub fn user(content: impl Into<String>) -> Self {
-        Self { role: MessageRole::User, content: content.into() }
+        Self {
+            role: MessageRole::User,
+            content: content.into(),
+        }
     }
 
     pub fn assistant(content: impl Into<String>) -> Self {
-        Self { role: MessageRole::Assistant, content: content.into() }
+        Self {
+            role: MessageRole::Assistant,
+            content: content.into(),
+        }
     }
 
     pub fn developer(content: impl Into<String>) -> Self {
-        Self { role: MessageRole::Developer, content: content.into() }
+        Self {
+            role: MessageRole::Developer,
+            content: content.into(),
+        }
     }
 }
 

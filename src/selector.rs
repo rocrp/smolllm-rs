@@ -92,7 +92,11 @@ impl ModelInput {
 
 impl From<&str> for ModelInput {
     fn from(s: &str) -> Self {
-        let models: Vec<String> = s.split(',').map(|m| m.trim().to_string()).filter(|m| !m.is_empty()).collect();
+        let models: Vec<String> = s
+            .split(',')
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty())
+            .collect();
         ModelInput::Sequential(models)
     }
 }

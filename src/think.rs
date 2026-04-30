@@ -81,9 +81,15 @@ impl ThinkTagFilter {
         }
         let buf = std::mem::take(&mut self.buffer);
         if self.inside_think {
-            StreamChunk { content: String::new(), reasoning: buf }
+            StreamChunk {
+                content: String::new(),
+                reasoning: buf,
+            }
         } else {
-            StreamChunk { content: buf, reasoning: String::new() }
+            StreamChunk {
+                content: buf,
+                reasoning: String::new(),
+            }
         }
     }
 }
@@ -130,7 +136,10 @@ mod tests {
     #[test]
     fn test_think_tag_filter_basic() {
         let mut filter = ThinkTagFilter::new();
-        let chunk = StreamChunk { content: "<think>reasoning here</think>actual content".into(), reasoning: String::new() };
+        let chunk = StreamChunk {
+            content: "<think>reasoning here</think>actual content".into(),
+            reasoning: String::new(),
+        };
         let result = filter.feed(chunk);
         assert_eq!(result.reasoning, "reasoning here");
         assert_eq!(result.content, "actual content");
@@ -140,11 +149,17 @@ mod tests {
     fn test_think_tag_filter_split_across_chunks() {
         let mut filter = ThinkTagFilter::new();
 
-        let c1 = filter.feed(StreamChunk { content: "<think>part1".into(), reasoning: String::new() });
+        let c1 = filter.feed(StreamChunk {
+            content: "<think>part1".into(),
+            reasoning: String::new(),
+        });
         assert_eq!(c1.reasoning, "part1");
         assert!(c1.content.is_empty());
 
-        let c2 = filter.feed(StreamChunk { content: " part2</think>content".into(), reasoning: String::new() });
+        let c2 = filter.feed(StreamChunk {
+            content: " part2</think>content".into(),
+            reasoning: String::new(),
+        });
         assert_eq!(c2.reasoning, " part2");
         assert_eq!(c2.content, "content");
     }
@@ -152,12 +167,18 @@ mod tests {
     #[test]
     fn test_think_tag_filter_auto_disable() {
         let mut filter = ThinkTagFilter::new();
-        let chunk = StreamChunk { content: "<think>test</think>".into(), reasoning: "backend reasoning".into() };
+        let chunk = StreamChunk {
+            content: "<think>test</think>".into(),
+            reasoning: "backend reasoning".into(),
+        };
         let result = filter.feed(chunk);
         assert_eq!(result.reasoning, "backend reasoning");
         assert_eq!(result.content, "<think>test</think>");
 
-        let c2 = filter.feed(StreamChunk { content: "<think>more</think>".into(), reasoning: String::new() });
+        let c2 = filter.feed(StreamChunk {
+            content: "<think>more</think>".into(),
+            reasoning: String::new(),
+        });
         assert_eq!(c2.content, "<think>more</think>");
         assert!(c2.reasoning.is_empty());
     }
@@ -172,13 +193,19 @@ mod tests {
     #[test]
     fn test_flush() {
         let mut filter = ThinkTagFilter::new();
-        let result = filter.feed(StreamChunk { content: "<think>partial".into(), reasoning: String::new() });
+        let result = filter.feed(StreamChunk {
+            content: "<think>partial".into(),
+            reasoning: String::new(),
+        });
         assert_eq!(result.reasoning, "partial");
         assert!(result.content.is_empty());
 
         // Buffer holds partial close tag at chunk boundary
         let mut filter2 = ThinkTagFilter::new();
-        let _ = filter2.feed(StreamChunk { content: "hello<".into(), reasoning: String::new() });
+        let _ = filter2.feed(StreamChunk {
+            content: "hello<".into(),
+            reasoning: String::new(),
+        });
         let flushed = filter2.flush();
         assert_eq!(flushed.content, "<");
     }

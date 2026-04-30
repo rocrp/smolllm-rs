@@ -1,5 +1,3 @@
-use smolllm;
-
 #[tokio::main]
 async fn main() -> Result<(), smolllm::Error> {
     env_logger::init();
@@ -9,7 +7,9 @@ async fn main() -> Result<(), smolllm::Error> {
             .join(".env.smolllm"),
     );
 
-    let prompt = std::env::args().nth(1).unwrap_or_else(|| "What is Rust in one sentence?".into());
+    let prompt = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "What is Rust in one sentence?".into());
 
     let response = smolllm::ask(&*prompt).await?;
 

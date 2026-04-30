@@ -1,41 +1,27 @@
 use std::time::Duration;
 
 pub fn estimate_tokens(text: &str) -> usize {
-    if text.is_empty() { 0 } else { text.len() / 4 }
+    if text.is_empty() {
+        0
+    } else {
+        text.len() / 4
+    }
 }
 
 pub fn strip_backticks(text: &str) -> String {
-    if !text.starts_with("```") || !text.ends_with("```") {
+    let trimmed = text.trim();
+    if !trimmed.starts_with("```") || !trimmed.ends_with("```") || trimmed.len() < 6 {
         return text.to_string();
     }
-    let lines: Vec<&str> = text.split('\n').collect();
-    if lines.is_empty() {
-        return String::new();
-    }
-
-    let start = if lines[0].starts_with("```") { 1 } else { 0 };
-    let end = if lines.len() > start {
-        let last = lines[lines.len() - 1];
-        if last == "```" {
-            lines.len() - 1
-        } else if last.ends_with("```") {
-            lines.len()
-        } else {
-            lines.len()
-        }
-    } else {
-        lines.len()
+    let after_open = match trimmed[3..].find('\n') {
+        Some(n) => &trimmed[3 + n + 1..],
+        None => return text.to_string(),
     };
-
-    let mut result: Vec<&str> = lines[start..end].to_vec();
-    if let Some(last) = result.last_mut() {
-        if last.ends_with("```") && *last != "```" {
-            // Trim trailing ``` from the last line
-            let trimmed = &last[..last.len() - 3];
-            *last = trimmed;
-        }
-    }
-    result.join("\n")
+    let body = match after_open.trim_end().strip_suffix("```") {
+        Some(b) => b,
+        None => return text.to_string(),
+    };
+    body.trim_end_matches('\n').to_string()
 }
 
 pub fn preview_api_key(key: &str) -> String {
@@ -95,7 +81,10 @@ mod tests {
     #[test]
     fn test_strip_backticks() {
         assert_eq!(strip_backticks("hello"), "hello");
-        assert_eq!(strip_backticks("```rust\nfn main() {}\n```"), "fn main() {}");
+        assert_eq!(
+            strip_backticks("```rust\nfn main() {}\n```"),
+            "fn main() {}"
+        );
         assert_eq!(strip_backticks("```\ncode\n```"), "code");
     }
 

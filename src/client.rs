@@ -1,15 +1,21 @@
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures_core::Stream;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 
 use crate::balancer;
 use crate::error::Error;
 use crate::image::image_to_data_url;
-use crate::provider::{build_request_url, parse_model_string, resolve_api_key, resolve_base_url};
+use crate::provider::{
+    build_request_url, parse_model_string, resolve_api_key, resolve_base_url, ParsedModel,
+};
+use crate::request::RequestConfig;
 use crate::think::ThinkTagFilter;
 use crate::types::*;
 use crate::utils::*;
@@ -18,94 +24,132 @@ const MAX_RETRIES: usize = 3;
 const RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
 const RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
 const RETRY_BACKOFF_SCALE: u32 = 3;
+const SSE_CHANNEL_CAPACITY: usize = 32;
 
-pub(crate) struct RequestConfig {
-    pub prompt: Prompt,
-    pub system_prompt: Option<String>,
-    pub model_input: Option<crate::selector::ModelInput>,
-    pub api_key: Option<String>,
-    pub base_url: Option<String>,
-    pub timeout: Duration,
-    pub remove_backticks: bool,
-    pub image_paths: Vec<String>,
-    pub temperature: Option<f64>,
-    pub top_p: Option<f64>,
-    pub reasoning_effort: Option<String>,
-    pub handler: Option<Box<dyn Fn(&StreamChunk) + Send + Sync>>,
-    pub hook: Option<Box<dyn Fn(RequestEvent) + Send + Sync>>,
-    pub http_client: Option<reqwest::Client>,
-}
+// --- Public entry points ----------------------------------------------------
 
 pub(crate) async fn execute_ask(config: RequestConfig) -> Result<LLMResponse, Error> {
-    let model_env = config
-        .model_input
-        .clone()
-        .or_else(|| {
-            std::env::var("SMOLLLM_MODEL")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .map(|s| crate::selector::ModelInput::from(s.as_str()))
-        })
-        .ok_or(Error::NoValidModels)?;
+    run_with_fallback(&config, |dispatch, response, started, config| {
+        Box::pin(ask_finalize(dispatch, response, started, config))
+    })
+    .await
+}
 
-    let mut selector = model_env.into_selector();
+pub(crate) async fn execute_stream(config: RequestConfig) -> Result<StreamResponse, Error> {
+    run_with_fallback(&config, |dispatch, response, started, _config| {
+        Box::pin(stream_finalize(dispatch, response, started))
+    })
+    .await
+}
+
+// --- Fallback driver -------------------------------------------------------
+
+type FinalizeFut<'a, R> = Pin<Box<dyn Future<Output = Result<R, Error>> + Send + 'a>>;
+
+async fn run_with_fallback<R, F>(config: &RequestConfig, finalize: F) -> Result<R, Error>
+where
+    R: HasUsage,
+    F: for<'a> Fn(Dispatch, reqwest::Response, Instant, &'a RequestConfig) -> FinalizeFut<'a, R>,
+{
+    let model_input = config.resolve_model_input().ok_or(Error::NoValidModels)?;
+    let mut selector = model_input.into_selector();
+    let client = config.http_client.clone().unwrap_or_default();
+
     let mut last_err: Option<Error> = None;
-
     while let Some(model_str) = selector.next_model() {
-        match try_ask_model(&model_str, &config).await {
+        let attempt = dispatch_one(&model_str, config, &client, &finalize).await;
+        match attempt {
             Ok(response) => {
-                if let Some(ref hook) = config.hook {
-                    hook(RequestEvent {
-                        usage: response.usage.clone(),
-                        error: None,
-                    });
-                }
+                fire_hook(config, response.usage(), None);
                 return Ok(response);
             }
-            Err(e) => {
+            Err(err) => {
                 if selector.has_more() {
-                    log::warn!("Model {} failed, trying fallback: {}", model_str, e);
+                    log::warn!("Model {model_str} failed, trying fallback: {err}");
                 } else {
-                    log::warn!("Model {} failed: {}", model_str, e);
+                    log::warn!("Model {model_str} failed: {err}");
                 }
-                if let Some(ref hook) = config.hook {
-                    hook(RequestEvent {
-                        usage: Usage::default(),
-                        error: Some(e.to_string()),
-                    });
-                }
-                last_err = Some(e);
+                fire_hook(config, Usage::default(), Some(err.to_string()));
+                last_err = Some(err);
             }
         }
     }
-
     Err(last_err.unwrap_or(Error::NoValidModels))
 }
 
-async fn try_ask_model(model_str: &str, config: &RequestConfig) -> Result<LLMResponse, Error> {
-    let parsed = parse_model_string(model_str)?;
-    let base_url = resolve_base_url(&parsed, config.base_url.as_deref())?;
-    let api_key = resolve_api_key(&parsed, config.api_key.as_deref())?;
-    let (chosen_key, chosen_url) = balancer::choose_pair(&api_key, &base_url)?;
-    let request_url = build_request_url(&chosen_url, &parsed.provider_name);
-    let body = build_request_body(&parsed.model_name, config)?;
-    let input_tokens = estimate_tokens(&serde_json::to_string(&body).unwrap_or_default());
-
+async fn dispatch_one<R, F>(
+    model_str: &str,
+    config: &RequestConfig,
+    client: &reqwest::Client,
+    finalize: &F,
+) -> Result<R, Error>
+where
+    F: for<'a> Fn(Dispatch, reqwest::Response, Instant, &'a RequestConfig) -> FinalizeFut<'a, R>,
+{
+    let dispatch = Dispatch::prepare(model_str, config)?;
     log::info!(
         "Sending request: url={} model={} key={} approx_tokens={}",
-        request_url,
-        parsed.model_name,
-        preview_api_key(&chosen_key),
-        input_tokens,
+        dispatch.request_url,
+        dispatch.parsed.model_name,
+        preview_api_key(&dispatch.chosen_key),
+        dispatch.input_tokens,
     );
+    let started = Instant::now();
+    let response = send_with_retry(client, &dispatch, config.timeout).await?;
+    finalize(dispatch, response, started, config).await
+}
 
+fn fire_hook(config: &RequestConfig, usage: Usage, error: Option<String>) {
+    if let Some(ref hook) = config.hook {
+        hook(RequestEvent { usage, error });
+    }
+}
+
+// --- Per-model dispatch ----------------------------------------------------
+
+pub(crate) struct Dispatch {
+    pub model_str: String,
+    pub parsed: ParsedModel,
+    pub request_url: String,
+    pub chosen_key: String,
+    pub body: ChatCompletionRequest,
+    pub input_tokens: usize,
+}
+
+impl Dispatch {
+    fn prepare(model_str: &str, config: &RequestConfig) -> Result<Self, Error> {
+        let parsed = parse_model_string(model_str)?;
+        let base_url = resolve_base_url(&parsed, config.base_url.as_deref())?;
+        let api_key = resolve_api_key(&parsed, config.api_key.as_deref())?;
+        let (chosen_key, chosen_url) = balancer::choose_pair(&api_key, &base_url)?;
+        let request_url = build_request_url(&chosen_url, &parsed.provider_name);
+        let body = build_request_body(&parsed.model_name, config)?;
+        let input_tokens = estimate_tokens(&serde_json::to_string(&body).unwrap_or_default());
+        Ok(Self {
+            model_str: model_str.to_string(),
+            parsed,
+            request_url,
+            chosen_key,
+            body,
+            input_tokens,
+        })
+    }
+}
+
+// --- HTTP send with retry --------------------------------------------------
+
+async fn send_with_retry(
+    client: &reqwest::Client,
+    dispatch: &Dispatch,
+    timeout: Duration,
+) -> Result<reqwest::Response, Error> {
     let mut last_err: Option<Error> = None;
     for attempt in 0..MAX_RETRIES {
         if attempt > 0 {
             let delay = retry_delay(attempt);
             log::warn!(
                 "Retrying after transient error: model={} attempt={} delay={:?} err={}",
-                model_str,
+                dispatch.model_str,
                 attempt + 1,
                 delay,
                 last_err.as_ref().map(|e| e.to_string()).unwrap_or_default(),
@@ -113,32 +157,24 @@ async fn try_ask_model(model_str: &str, config: &RequestConfig) -> Result<LLMRes
             tokio::time::sleep(delay).await;
         }
 
-        let client = config
-            .http_client
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(reqwest::Client::new);
-
-        let start = Instant::now();
-
-        let resp = client
-            .post(&request_url)
+        let send_result = client
+            .post(&dispatch.request_url)
             .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {chosen_key}"))
-            .timeout(config.timeout)
-            .json(&body)
+            .header("Authorization", format!("Bearer {}", dispatch.chosen_key))
+            .timeout(timeout)
+            .json(&dispatch.body)
             .send()
             .await;
 
-        let resp = match resp {
+        let resp = match send_result {
             Ok(r) => r,
             Err(e) => {
-                last_err = Some(Error::Request(e));
-                if last_err.as_ref().is_some_and(|e| e.is_retryable()) && attempt < MAX_RETRIES - 1
-                {
+                let err = Error::Request(e);
+                if err.is_retryable() && attempt < MAX_RETRIES - 1 {
+                    last_err = Some(err);
                     continue;
                 }
-                return Err(last_err.unwrap());
+                return Err(err);
             }
         };
 
@@ -156,173 +192,98 @@ async fn try_ask_model(model_str: &str, config: &RequestConfig) -> Result<LLMRes
             return Err(err);
         }
 
-        let byte_stream = resp.bytes_stream();
-        let (content, reasoning, ttft) =
-            consume_sse_stream(byte_stream, config.handler.as_deref(), start).await?;
-
-        let content = if config.remove_backticks {
-            strip_backticks(&content)
-        } else {
-            content
-        };
-
-        if content.trim().is_empty() && reasoning.trim().is_empty() {
-            return Err(Error::EmptyResponse {
-                model: model_str.to_string(),
-            });
-        }
-
-        let total = start.elapsed();
-        let output_tokens = estimate_tokens(&format!("{content}{reasoning}"));
-
-        log::info!(
-            "{}",
-            format_metrics(&parsed.model_name, input_tokens, output_tokens, total, ttft)
-        );
-
-        return Ok(LLMResponse {
-            text: content,
-            reasoning,
-            model: model_str.to_string(),
-            model_name: parsed.model_name.clone(),
-            provider: parsed.provider_name.clone(),
-            usage: Usage {
-                provider: parsed.provider_name.clone(),
-                model: model_str.to_string(),
-                model_name: parsed.model_name.clone(),
-                api_key_hint: preview_api_key(&chosen_key),
-                input_tokens,
-                output_tokens,
-                duration: total,
-                ttft,
-            },
-        });
+        return Ok(resp);
     }
-
     Err(last_err.unwrap_or(Error::Other("max retries exhausted".into())))
 }
 
-pub(crate) async fn execute_stream(config: RequestConfig) -> Result<StreamResponse, Error> {
-    let model_env = config
-        .model_input
-        .clone()
-        .or_else(|| {
-            std::env::var("SMOLLLM_MODEL")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .map(|s| crate::selector::ModelInput::from(s.as_str()))
-        })
-        .ok_or(Error::NoValidModels)?;
-
-    let mut selector = model_env.into_selector();
-    let mut last_err: Option<Error> = None;
-
-    while let Some(model_str) = selector.next_model() {
-        match try_stream_model(&model_str, &config).await {
-            Ok(stream_resp) => return Ok(stream_resp),
-            Err(e) => {
-                if selector.has_more() {
-                    log::warn!("Model {} failed, trying fallback: {}", model_str, e);
-                } else {
-                    log::warn!("Model {} failed: {}", model_str, e);
-                }
-                last_err = Some(e);
-            }
-        }
+fn retry_delay(attempt: usize) -> Duration {
+    let mut d = RETRY_BASE_DELAY;
+    for _ in 0..attempt {
+        d = d.saturating_mul(RETRY_BACKOFF_SCALE);
     }
-
-    Err(last_err.unwrap_or(Error::NoValidModels))
+    d.min(RETRY_MAX_DELAY)
 }
 
-async fn try_stream_model(model_str: &str, config: &RequestConfig) -> Result<StreamResponse, Error> {
-    let parsed = parse_model_string(model_str)?;
-    let base_url = resolve_base_url(&parsed, config.base_url.as_deref())?;
-    let api_key = resolve_api_key(&parsed, config.api_key.as_deref())?;
-    let (chosen_key, chosen_url) = balancer::choose_pair(&api_key, &base_url)?;
-    let request_url = build_request_url(&chosen_url, &parsed.provider_name);
-    let body = build_request_body(&parsed.model_name, config)?;
-    let input_tokens = estimate_tokens(&serde_json::to_string(&body).unwrap_or_default());
+// --- Finalizers ------------------------------------------------------------
+
+async fn ask_finalize(
+    dispatch: Dispatch,
+    response: reqwest::Response,
+    started: Instant,
+    config: &RequestConfig,
+) -> Result<LLMResponse, Error> {
+    let byte_stream = response.bytes_stream();
+    let (content, reasoning, ttft) =
+        consume_sse_stream(byte_stream, config.handler.as_deref(), started).await?;
+
+    let content = if config.remove_backticks {
+        strip_backticks(&content)
+    } else {
+        content
+    };
+
+    if content.trim().is_empty() && reasoning.trim().is_empty() {
+        return Err(Error::EmptyResponse {
+            model: dispatch.model_str,
+        });
+    }
+
+    let total = started.elapsed();
+    let output_tokens = estimate_tokens(&format!("{content}{reasoning}"));
 
     log::info!(
-        "Sending stream request: url={} model={} key={} approx_tokens={}",
-        request_url,
-        parsed.model_name,
-        preview_api_key(&chosen_key),
-        input_tokens,
+        "{}",
+        format_metrics(
+            &dispatch.parsed.model_name,
+            dispatch.input_tokens,
+            output_tokens,
+            total,
+            ttft
+        )
     );
 
-    let mut last_err: Option<Error> = None;
-    for attempt in 0..MAX_RETRIES {
-        if attempt > 0 {
-            let delay = retry_delay(attempt);
-            log::warn!(
-                "Retrying stream after transient error: model={} attempt={} delay={:?}",
-                model_str,
-                attempt + 1,
-                delay,
-            );
-            tokio::time::sleep(delay).await;
-        }
-
-        let client = config
-            .http_client
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(reqwest::Client::new);
-
-        let resp = client
-            .post(&request_url)
-            .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {chosen_key}"))
-            .timeout(config.timeout)
-            .json(&body)
-            .send()
-            .await;
-
-        let resp = match resp {
-            Ok(r) => r,
-            Err(e) => {
-                last_err = Some(Error::Request(e));
-                if last_err.as_ref().is_some_and(|e| e.is_retryable()) && attempt < MAX_RETRIES - 1
-                {
-                    continue;
-                }
-                return Err(last_err.unwrap());
-            }
-        };
-
-        let status = resp.status().as_u16();
-        if status >= 400 {
-            let body_text = resp.text().await.unwrap_or_default();
-            let err = Error::Http {
-                status,
-                body: body_text,
-            };
-            if err.is_retryable() && attempt < MAX_RETRIES - 1 {
-                last_err = Some(err);
-                continue;
-            }
-            return Err(err);
-        }
-
-        let byte_stream = resp.bytes_stream();
-        let (tx, rx) = mpsc::channel::<Result<StreamChunk, Error>>(32);
-
-        tokio::spawn(async move {
-            process_sse_task(byte_stream, tx).await;
-        });
-
-        return Ok(StreamResponse::new(
-            rx,
-            model_str.to_string(),
-            parsed.model_name.clone(),
-            parsed.provider_name.clone(),
-            input_tokens,
-        ));
-    }
-
-    Err(last_err.unwrap_or(Error::Other("max retries exhausted".into())))
+    Ok(LLMResponse {
+        text: content,
+        reasoning,
+        model: dispatch.model_str.clone(),
+        model_name: dispatch.parsed.model_name.clone(),
+        provider: dispatch.parsed.provider_name.clone(),
+        usage: Usage {
+            provider: dispatch.parsed.provider_name,
+            model: dispatch.model_str,
+            model_name: dispatch.parsed.model_name,
+            api_key_hint: preview_api_key(&dispatch.chosen_key),
+            input_tokens: dispatch.input_tokens,
+            output_tokens,
+            duration: total,
+            ttft,
+        },
+    })
 }
+
+async fn stream_finalize(
+    dispatch: Dispatch,
+    response: reqwest::Response,
+    _started: Instant,
+) -> Result<StreamResponse, Error> {
+    let byte_stream = response.bytes_stream();
+    let (tx, rx) = mpsc::channel::<Result<StreamChunk, Error>>(SSE_CHANNEL_CAPACITY);
+
+    tokio::spawn(async move {
+        process_sse_task(byte_stream, tx).await;
+    });
+
+    Ok(StreamResponse::new(
+        rx,
+        dispatch.model_str,
+        dispatch.parsed.model_name,
+        dispatch.parsed.provider_name,
+        dispatch.input_tokens,
+    ))
+}
+
+// --- Request body construction ---------------------------------------------
 
 fn build_request_body(
     model_name: &str,
@@ -387,19 +348,135 @@ fn build_request_body(
 }
 
 #[derive(Serialize)]
-struct ChatCompletionRequest {
-    model: String,
-    messages: Vec<serde_json::Value>,
-    stream: bool,
+pub(crate) struct ChatCompletionRequest {
+    pub model: String,
+    pub messages: Vec<serde_json::Value>,
+    pub stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f64>,
+    pub temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    top_p: Option<f64>,
+    pub top_p: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_effort: Option<String>,
+    pub reasoning_effort: Option<String>,
 }
 
-// --- SSE parsing ---
+// --- SSE parsing -----------------------------------------------------------
+
+#[derive(Default, Deserialize)]
+struct SseFrame {
+    #[serde(default)]
+    error: Option<SseError>,
+    #[serde(default)]
+    choices: Vec<SseChoice>,
+}
+
+#[derive(Default, Deserialize)]
+struct SseError {
+    #[serde(default)]
+    message: String,
+}
+
+#[derive(Default, Deserialize)]
+struct SseChoice {
+    #[serde(default)]
+    delta: SseDelta,
+}
+
+#[derive(Default, Deserialize)]
+struct SseDelta {
+    #[serde(default)]
+    content: String,
+    #[serde(default, alias = "reasoning")]
+    reasoning_content: String,
+}
+
+struct SseParser {
+    buffer: Vec<u8>,
+    think_filter: ThinkTagFilter,
+}
+
+impl SseParser {
+    fn new() -> Self {
+        Self {
+            buffer: Vec::new(),
+            think_filter: ThinkTagFilter::new(),
+        }
+    }
+
+    fn feed(&mut self, bytes: &[u8]) -> Vec<Result<StreamChunk, Error>> {
+        self.buffer.extend_from_slice(bytes);
+        let mut chunks = Vec::new();
+
+        while let Some(pos) = self.buffer.iter().position(|&b| b == b'\n') {
+            let line_bytes: Vec<u8> = self.buffer.drain(..=pos).collect();
+            let mut line = std::str::from_utf8(&line_bytes[..line_bytes.len() - 1])
+                .map(str::to_string)
+                .unwrap_or_else(|_| {
+                    String::from_utf8_lossy(&line_bytes[..line_bytes.len() - 1]).into_owned()
+                });
+            if line.ends_with('\r') {
+                line.pop();
+            }
+
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed == "data: [DONE]" {
+                continue;
+            }
+            let payload = match trimmed.strip_prefix("data:") {
+                Some(p) => p.trim(),
+                None => continue,
+            };
+            if payload.is_empty() {
+                continue;
+            }
+
+            match self.parse_sse_data(payload) {
+                Ok(Some(chunk)) => chunks.push(Ok(chunk)),
+                Ok(None) => {}
+                Err(e) => chunks.push(Err(e)),
+            }
+        }
+
+        chunks
+    }
+
+    fn flush(&mut self) -> Option<StreamChunk> {
+        let chunk = self.think_filter.flush();
+        (!chunk.is_empty()).then_some(chunk)
+    }
+
+    fn parse_sse_data(&mut self, data: &str) -> Result<Option<StreamChunk>, Error> {
+        let frame: SseFrame = serde_json::from_str(data)?;
+
+        if let Some(err) = frame.error {
+            let message = if err.message.is_empty() {
+                "unknown error".to_string()
+            } else {
+                err.message
+            };
+            return Err(Error::Stream {
+                message,
+                partial: String::new(),
+            });
+        }
+
+        let delta = match frame.choices.into_iter().next() {
+            Some(choice) => choice.delta,
+            None => return Ok(None),
+        };
+
+        if delta.content.is_empty() && delta.reasoning_content.is_empty() {
+            return Ok(None);
+        }
+
+        let raw = StreamChunk {
+            content: delta.content,
+            reasoning: delta.reasoning_content,
+        };
+        let filtered = self.think_filter.feed(raw);
+        Ok((!filtered.is_empty()).then_some(filtered))
+    }
+}
 
 async fn consume_sse_stream(
     byte_stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Unpin + Send,
@@ -417,9 +494,6 @@ async fn consume_sse_stream(
         let bytes = result?;
         for chunk_result in parser.feed(&bytes) {
             let chunk = chunk_result?;
-            if chunk.is_empty() {
-                continue;
-            }
             if first_token_time.is_none() && !chunk.content.is_empty() {
                 first_token_time = Some(Instant::now());
             }
@@ -440,7 +514,11 @@ async fn consume_sse_stream(
     }
 
     let ttft = first_token_time.map(|t| t.duration_since(start));
-    Ok((content.trim().to_string(), reasoning.trim().to_string(), ttft))
+    Ok((
+        content.trim().to_string(),
+        reasoning.trim().to_string(),
+        ttft,
+    ))
 }
 
 async fn process_sse_task(
@@ -448,7 +526,6 @@ async fn process_sse_task(
     tx: mpsc::Sender<Result<StreamChunk, Error>>,
 ) {
     let mut parser = SseParser::new();
-
     tokio::pin!(byte_stream);
 
     while let Some(result) = byte_stream.next().await {
@@ -456,7 +533,7 @@ async fn process_sse_task(
             Ok(bytes) => {
                 for chunk_result in parser.feed(&bytes) {
                     match chunk_result {
-                        Ok(chunk) if !chunk.is_empty() => {
+                        Ok(chunk) => {
                             if tx.send(Ok(chunk)).await.is_err() {
                                 return;
                             }
@@ -465,7 +542,6 @@ async fn process_sse_task(
                             let _ = tx.send(Err(e)).await;
                             return;
                         }
-                        _ => {}
                     }
                 }
             }
@@ -477,137 +553,18 @@ async fn process_sse_task(
     }
 
     if let Some(chunk) = parser.flush() {
-        if !chunk.is_empty() {
-            let _ = tx.send(Ok(chunk)).await;
-        }
+        let _ = tx.send(Ok(chunk)).await;
     }
 }
 
-struct SseParser {
-    buffer: String,
-    think_filter: ThinkTagFilter,
-}
-
-impl SseParser {
-    fn new() -> Self {
-        Self {
-            buffer: String::new(),
-            think_filter: ThinkTagFilter::new(),
-        }
-    }
-
-    fn feed(&mut self, bytes: &[u8]) -> Vec<Result<StreamChunk, Error>> {
-        let text = String::from_utf8_lossy(bytes);
-        self.buffer.push_str(&text);
-
-        let mut chunks = Vec::new();
-
-        while let Some(newline_pos) = self.buffer.find('\n') {
-            let line = self.buffer[..newline_pos]
-                .trim_end_matches('\r')
-                .to_string();
-            self.buffer = self.buffer[newline_pos + 1..].to_string();
-
-            if line.trim().is_empty() {
-                continue;
-            }
-
-            let trimmed = line.trim();
-            if trimmed == "data: [DONE]" {
-                continue;
-            }
-
-            if let Some(data) = trimmed.strip_prefix("data:") {
-                let payload = data.trim();
-                if payload.is_empty() {
-                    continue;
-                }
-                match self.parse_sse_data(payload) {
-                    Ok(Some(chunk)) => chunks.push(Ok(chunk)),
-                    Ok(None) => {}
-                    Err(e) => chunks.push(Err(e)),
-                }
-            }
-        }
-
-        chunks
-    }
-
-    fn flush(&mut self) -> Option<StreamChunk> {
-        let chunk = self.think_filter.flush();
-        if chunk.is_empty() {
-            None
-        } else {
-            Some(chunk)
-        }
-    }
-
-    fn parse_sse_data(&mut self, data: &str) -> Result<Option<StreamChunk>, Error> {
-        let json: serde_json::Value = serde_json::from_str(data)?;
-
-        if let Some(error) = json.get("error") {
-            let msg = error
-                .get("message")
-                .and_then(|m| m.as_str())
-                .unwrap_or("unknown error");
-            return Err(Error::Stream {
-                message: msg.to_string(),
-                partial: String::new(),
-            });
-        }
-
-        let delta = match json.pointer("/choices/0/delta") {
-            Some(d) => d,
-            None => return Ok(None),
-        };
-
-        let content = delta
-            .get("content")
-            .and_then(|c| c.as_str())
-            .unwrap_or("");
-        let reasoning_content = delta
-            .get("reasoning_content")
-            .or_else(|| delta.get("reasoning"))
-            .and_then(|r| r.as_str())
-            .unwrap_or("");
-
-        if content.is_empty() && reasoning_content.is_empty() {
-            return Ok(None);
-        }
-
-        let raw = StreamChunk {
-            content: content.to_string(),
-            reasoning: reasoning_content.to_string(),
-        };
-
-        let filtered = self.think_filter.feed(raw);
-        if filtered.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(filtered))
-        }
-    }
-}
-
-fn retry_delay(attempt: usize) -> Duration {
-    let mut d = RETRY_BASE_DELAY;
-    for _ in 0..attempt {
-        d = d.saturating_mul(RETRY_BACKOFF_SCALE);
-    }
-    d.min(RETRY_MAX_DELAY)
-}
-
-// --- StreamResponse ---
-
-use std::pin::Pin;
-use std::task::{Context, Poll};
+// --- StreamResponse --------------------------------------------------------
 
 pub struct StreamResponse {
     rx: tokio_stream::wrappers::ReceiverStream<Result<StreamChunk, Error>>,
-    pub model: String,
-    pub model_name: String,
-    pub provider: String,
-    pub reasoning: String,
+    model: String,
+    model_name: String,
+    provider: String,
+    reasoning: String,
     input_chars: usize,
     output_chars: usize,
     start: Instant,
@@ -629,12 +586,28 @@ impl StreamResponse {
             model_name,
             provider,
             reasoning: String::new(),
-            input_chars: input_tokens * 4,
+            input_chars: input_tokens.saturating_mul(4),
             output_chars: 0,
             start: Instant::now(),
             first_token_time: None,
             metrics_logged: false,
         }
+    }
+
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    pub fn model_name(&self) -> &str {
+        &self.model_name
+    }
+
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    pub fn reasoning(&self) -> &str {
+        &self.reasoning
     }
 
     pub fn usage(&self) -> Usage {
@@ -685,5 +658,21 @@ impl Stream for StreamResponse {
             }
             Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+trait HasUsage {
+    fn usage(&self) -> Usage;
+}
+
+impl HasUsage for LLMResponse {
+    fn usage(&self) -> Usage {
+        self.usage.clone()
+    }
+}
+
+impl HasUsage for StreamResponse {
+    fn usage(&self) -> Usage {
+        StreamResponse::usage(self)
     }
 }

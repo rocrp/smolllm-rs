@@ -15,6 +15,9 @@ pub enum Error {
     #[error("invalid model string: {0}")]
     InvalidModel(String),
 
+    #[error("invalid parameter: {0}")]
+    InvalidParam(String),
+
     #[error("no valid models configured")]
     NoValidModels,
 
@@ -45,4 +48,3 @@ impl Error {
         }
     }
 }
-

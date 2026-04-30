@@ -54,11 +54,17 @@ fn build_pairs(keys: &str, urls: &str) -> Result<Vec<PairKey>, Error> {
     match (key_list.len(), url_list.len()) {
         (_, 1) => Ok(key_list
             .into_iter()
-            .map(|k| PairKey { key: k, url: url_list[0].clone() })
+            .map(|k| PairKey {
+                key: k,
+                url: url_list[0].clone(),
+            })
             .collect()),
         (1, _) => Ok(url_list
             .into_iter()
-            .map(|u| PairKey { key: key_list[0].clone(), url: u })
+            .map(|u| PairKey {
+                key: key_list[0].clone(),
+                url: u,
+            })
             .collect()),
         (kn, un) if kn == un => Ok(key_list
             .into_iter()
@@ -74,10 +80,7 @@ fn parse_list(items: &str) -> Result<Vec<String>, Error> {
     if items.is_empty() {
         return Err(Error::Other("value must not be empty".into()));
     }
-    let result: Vec<String> = items
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .collect();
+    let result: Vec<String> = items.split(',').map(|s| s.trim().to_string()).collect();
     if result.iter().any(|s| s.is_empty()) {
         return Err(Error::Other("list contains empty entry".into()));
     }

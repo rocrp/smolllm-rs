@@ -1,4 +1,3 @@
-use smolllm;
 use tokio_stream::StreamExt;
 
 #[tokio::main]
@@ -22,8 +21,8 @@ async fn main() -> Result<(), smolllm::Error> {
     }
     println!();
 
-    if !stream.reasoning.is_empty() {
-        println!("\nReasoning: {}", stream.reasoning);
+    if !stream.reasoning().is_empty() {
+        println!("\nReasoning: {}", stream.reasoning());
     }
 
     let usage = stream.usage();

@@ -4,6 +4,7 @@ mod client;
 mod error;
 mod image;
 mod provider;
+mod request;
 mod selector;
 mod think;
 mod types;

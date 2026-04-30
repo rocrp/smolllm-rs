@@ -1,6 +1,6 @@
-use std::sync::LazyLock;
 use std::collections::HashMap;
 use std::env;
+use std::sync::LazyLock;
 
 use crate::error::Error;
 
@@ -8,56 +8,84 @@ use crate::error::Error;
 pub struct ProviderInfo {
     pub name: &'static str,
     pub base_url: &'static str,
-    pub default_model: &'static str,
+    pub default_model: Option<&'static str>,
 }
 
-static PROVIDERS: LazyLock<HashMap<&'static str, ProviderInfo>> = LazyLock::new(|| {
-    let entries: Vec<ProviderInfo> = vec![
-        ProviderInfo { name: "aihubmix",                base_url: "https://aihubmix.com",                           default_model: "" },
-        ProviderInfo { name: "anthropic",               base_url: "https://api.anthropic.com/",                      default_model: "" },
-        ProviderInfo { name: "azure-openai",            base_url: "",                                                default_model: "" },
-        ProviderInfo { name: "baichuan",                base_url: "https://api.baichuan-ai.com",                     default_model: "" },
-        ProviderInfo { name: "baidu-cloud",             base_url: "https://qianfan.baidubce.com/v2/",                default_model: "" },
-        ProviderInfo { name: "cerebras",                base_url: "https://api.cerebras.ai",                         default_model: "" },
-        ProviderInfo { name: "dashscope",               base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1/", default_model: "" },
-        ProviderInfo { name: "deepseek",                base_url: "https://api.deepseek.com",                        default_model: "" },
-        ProviderInfo { name: "dmxapi",                  base_url: "https://www.dmxapi.cn",                           default_model: "" },
-        ProviderInfo { name: "doubao",                  base_url: "https://ark.cn-beijing.volces.com/api/v3/",       default_model: "" },
-        ProviderInfo { name: "fireworks",               base_url: "https://api.fireworks.ai/inference",              default_model: "" },
-        ProviderInfo { name: "gemini",                  base_url: "https://generativelanguage.googleapis.com",       default_model: "gemini-2.0-flash" },
-        ProviderInfo { name: "gitee-ai",                base_url: "https://ai.gitee.com",                           default_model: "" },
-        ProviderInfo { name: "github",                  base_url: "https://models.inference.ai.azure.com/",          default_model: "" },
-        ProviderInfo { name: "graphrag-kylin-mountain", base_url: "",                                                default_model: "" },
-        ProviderInfo { name: "grok",                    base_url: "https://api.x.ai",                                default_model: "" },
-        ProviderInfo { name: "groq",                    base_url: "https://api.groq.com/openai",                     default_model: "" },
-        ProviderInfo { name: "hunyuan",                 base_url: "https://api.hunyuan.cloud.tencent.com",           default_model: "" },
-        ProviderInfo { name: "hyperbolic",              base_url: "https://api.hyperbolic.xyz",                      default_model: "" },
-        ProviderInfo { name: "infini",                  base_url: "https://cloud.infini-ai.com/maas",                default_model: "" },
-        ProviderInfo { name: "jina",                    base_url: "https://api.jina.ai",                             default_model: "" },
-        ProviderInfo { name: "lmstudio",                base_url: "http://localhost:1234",                           default_model: "" },
-        ProviderInfo { name: "minimax",                 base_url: "https://api.minimax.chat/v1/",                    default_model: "" },
-        ProviderInfo { name: "mistral",                 base_url: "https://api.mistral.ai",                          default_model: "" },
-        ProviderInfo { name: "modelscope",              base_url: "https://api-inference.modelscope.cn/v1/",         default_model: "" },
-        ProviderInfo { name: "moonshot",                base_url: "https://api.moonshot.cn",                         default_model: "" },
-        ProviderInfo { name: "nvidia",                  base_url: "https://integrate.api.nvidia.com",                default_model: "" },
-        ProviderInfo { name: "o3",                      base_url: "https://api.o3.fan",                              default_model: "" },
-        ProviderInfo { name: "ocoolai",                 base_url: "https://api.ocoolai.com",                         default_model: "" },
-        ProviderInfo { name: "ollama",                  base_url: "http://localhost:11434",                          default_model: "" },
-        ProviderInfo { name: "openai",                  base_url: "https://api.openai.com",                          default_model: "" },
-        ProviderInfo { name: "openrouter",              base_url: "https://openrouter.ai/api/v1/",                   default_model: "" },
-        ProviderInfo { name: "perplexity",              base_url: "https://api.perplexity.ai/",                      default_model: "" },
-        ProviderInfo { name: "ppio",                    base_url: "https://api.ppinfra.com/v3/openai",               default_model: "" },
-        ProviderInfo { name: "silicon",                 base_url: "https://api.siliconflow.cn",                      default_model: "" },
-        ProviderInfo { name: "stepfun",                 base_url: "https://api.stepfun.com",                         default_model: "" },
-        ProviderInfo { name: "tencent-cloud-ti",        base_url: "https://api.lkeap.cloud.tencent.com",             default_model: "" },
-        ProviderInfo { name: "together",                base_url: "https://api.together.xyz",                        default_model: "" },
-        ProviderInfo { name: "xirang",                  base_url: "https://wishub-x1.ctyun.cn",                      default_model: "" },
-        ProviderInfo { name: "yi",                      base_url: "https://api.lingyiwanwu.com",                     default_model: "" },
-        ProviderInfo { name: "zhinao",                  base_url: "https://api.360.cn",                              default_model: "" },
-        ProviderInfo { name: "zhipu",                   base_url: "https://open.bigmodel.cn/api/paas/v4/",           default_model: "" },
-    ];
-    entries.into_iter().map(|p| (p.name, p)).collect()
-});
+const fn p(
+    name: &'static str,
+    base_url: &'static str,
+    default_model: Option<&'static str>,
+) -> ProviderInfo {
+    ProviderInfo {
+        name,
+        base_url,
+        default_model,
+    }
+}
+
+static PROVIDER_LIST: &[ProviderInfo] = &[
+    p("aihubmix", "https://aihubmix.com", None),
+    p("anthropic", "https://api.anthropic.com/", None),
+    p("azure-openai", "", None),
+    p("baichuan", "https://api.baichuan-ai.com", None),
+    p("baidu-cloud", "https://qianfan.baidubce.com/v2/", None),
+    p("cerebras", "https://api.cerebras.ai", None),
+    p(
+        "dashscope",
+        "https://dashscope.aliyuncs.com/compatible-mode/v1/",
+        None,
+    ),
+    p("deepseek", "https://api.deepseek.com", None),
+    p("dmxapi", "https://www.dmxapi.cn", None),
+    p("doubao", "https://ark.cn-beijing.volces.com/api/v3/", None),
+    p("fireworks", "https://api.fireworks.ai/inference", None),
+    p(
+        "gemini",
+        "https://generativelanguage.googleapis.com",
+        Some("gemini-2.0-flash"),
+    ),
+    p("gitee-ai", "https://ai.gitee.com", None),
+    p("github", "https://models.inference.ai.azure.com/", None),
+    p("graphrag-kylin-mountain", "", None),
+    p("grok", "https://api.x.ai", None),
+    p("groq", "https://api.groq.com/openai", None),
+    p("hunyuan", "https://api.hunyuan.cloud.tencent.com", None),
+    p("hyperbolic", "https://api.hyperbolic.xyz", None),
+    p("infini", "https://cloud.infini-ai.com/maas", None),
+    p("jina", "https://api.jina.ai", None),
+    p("lmstudio", "http://localhost:1234", None),
+    p("minimax", "https://api.minimax.chat/v1/", None),
+    p("mistral", "https://api.mistral.ai", None),
+    p(
+        "modelscope",
+        "https://api-inference.modelscope.cn/v1/",
+        None,
+    ),
+    p("moonshot", "https://api.moonshot.cn", None),
+    p("nvidia", "https://integrate.api.nvidia.com", None),
+    p("o3", "https://api.o3.fan", None),
+    p("ocoolai", "https://api.ocoolai.com", None),
+    p("ollama", "http://localhost:11434", None),
+    p("openai", "https://api.openai.com", None),
+    p("openrouter", "https://openrouter.ai/api/v1/", None),
+    p("perplexity", "https://api.perplexity.ai/", None),
+    p("ppio", "https://api.ppinfra.com/v3/openai", None),
+    p("silicon", "https://api.siliconflow.cn", None),
+    p("stepfun", "https://api.stepfun.com", None),
+    p(
+        "tencent-cloud-ti",
+        "https://api.lkeap.cloud.tencent.com",
+        None,
+    ),
+    p("together", "https://api.together.xyz", None),
+    p("xirang", "https://wishub-x1.ctyun.cn", None),
+    p("yi", "https://api.lingyiwanwu.com", None),
+    p("zhinao", "https://api.360.cn", None),
+    p("zhipu", "https://open.bigmodel.cn/api/paas/v4/", None),
+];
+
+static PROVIDERS: LazyLock<HashMap<&'static str, &'static ProviderInfo>> =
+    LazyLock::new(|| PROVIDER_LIST.iter().map(|info| (info.name, info)).collect());
 
 #[derive(Debug, Clone)]
 pub struct ParsedModel {
@@ -72,29 +100,20 @@ pub fn parse_model_string(model: &str) -> Result<ParsedModel, Error> {
         return Err(Error::InvalidModel("model string must not be empty".into()));
     }
 
-    let (provider_name, model_name) = if let Some(pos) = model.find('/') {
-        let prov = &model[..pos];
-        let name = model[pos + 1..].trim();
-        (prov.to_string(), name.to_string())
-    } else {
-        (model.to_string(), String::new())
+    let (provider_name, raw_model_name) = match model.split_once('/') {
+        Some((prov, name)) => (prov.to_string(), name.trim().to_string()),
+        None => (model.to_string(), String::new()),
     };
 
-    let base_url;
-    let final_model_name;
-
-    if let Some(info) = PROVIDERS.get(provider_name.as_str()) {
-        base_url = info.base_url.to_string();
-        final_model_name = if model_name.is_empty() {
-            if info.default_model.is_empty() {
-                return Err(Error::InvalidModel(format!(
-                    "model name missing for provider '{provider_name}'"
-                )));
-            }
-            info.default_model.to_string()
+    let (base_url, model_name) = if let Some(info) = PROVIDERS.get(provider_name.as_str()) {
+        let model_name = if raw_model_name.is_empty() {
+            info.default_model.map(str::to_string).ok_or_else(|| {
+                Error::InvalidModel(format!("model name missing for provider '{provider_name}'"))
+            })?
         } else {
-            model_name
+            raw_model_name
         };
+        (info.base_url.to_string(), model_name)
     } else {
         let env_key = provider_env_key(&provider_name, "BASE_URL");
         let env_val = env::var(&env_key).unwrap_or_default();
@@ -103,19 +122,17 @@ pub fn parse_model_string(model: &str) -> Result<ParsedModel, Error> {
                 "unknown provider '{provider_name}' and {env_key} not set"
             )));
         }
-        base_url = env_val;
-        final_model_name = if model_name.is_empty() {
+        if raw_model_name.is_empty() {
             return Err(Error::InvalidModel(format!(
                 "model name missing for provider '{provider_name}'"
             )));
-        } else {
-            model_name
-        };
-    }
+        }
+        (env_val, raw_model_name)
+    };
 
     Ok(ParsedModel {
         provider_name,
-        model_name: final_model_name,
+        model_name,
         base_url,
     })
 }
@@ -174,16 +191,12 @@ pub fn resolve_api_key(parsed: &ParsedModel, explicit: Option<&str>) -> Result<S
 
 fn has_version_suffix(url: &str) -> bool {
     let trimmed = url.trim_end_matches('/');
-    if let Some(last_seg) = trimmed.rsplit('/').next() {
-        if last_seg.starts_with('v') && last_seg.len() > 1 {
-            return last_seg[1..].chars().all(|c| c.is_ascii_digit());
-        }
-        if last_seg.starts_with('v') && last_seg.len() > 1 {
-            let rest = &last_seg[1..];
-            return rest.chars().next().map_or(false, |c| c.is_ascii_digit());
-        }
-    }
-    false
+    let last = match trimmed.rsplit('/').next() {
+        Some(s) => s,
+        None => return false,
+    };
+    let mut chars = last.chars();
+    matches!(chars.next(), Some('v')) && chars.next().is_some_and(|c| c.is_ascii_digit())
 }
 
 pub fn build_request_url(base_url: &str, provider_name: &str) -> String {
@@ -249,6 +262,11 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_model_no_default() {
+        assert!(parse_model_string("openai").is_err());
+    }
+
+    #[test]
     fn test_build_request_url_default() {
         assert_eq!(
             build_request_url("https://api.openai.com", "openai"),
@@ -290,14 +308,19 @@ mod tests {
 
     #[test]
     fn test_provider_env_key() {
-        assert_eq!(provider_env_key("tencent-cloud-ti", "API_KEY"), "TENCENT_CLOUD_TI_API_KEY");
+        assert_eq!(
+            provider_env_key("tencent-cloud-ti", "API_KEY"),
+            "TENCENT_CLOUD_TI_API_KEY"
+        );
     }
 
     #[test]
     fn test_has_version_suffix() {
         assert!(has_version_suffix("https://api.com/v1"));
         assert!(has_version_suffix("https://api.com/v2/"));
+        assert!(has_version_suffix("https://api.com/v10"));
         assert!(!has_version_suffix("https://api.com/openai"));
         assert!(!has_version_suffix("https://api.com"));
+        assert!(!has_version_suffix("https://api.com/v"));
     }
 }

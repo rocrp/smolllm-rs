@@ -1,4 +1,3 @@
-use smolllm;
 use tokio_stream::StreamExt;
 
 #[tokio::main]
@@ -58,15 +57,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n=== Test 6: Temperature ===");
     let resp = smolllm::ask("Generate a random word")
         .model("gemini/gemini-flash-lite-latest")
-        .temperature(1.5)
+        .temperature(1.5)?
         .await?;
     println!("  Response: {}", resp.text);
 
     println!("\n=== Test 7: Remove backticks ===");
-    let resp = smolllm::ask("Write a hello world in python. Only output the code, wrapped in backticks.")
-        .model("gemini/gemini-flash-lite-latest")
-        .remove_backticks()
-        .await?;
+    let resp =
+        smolllm::ask("Write a hello world in python. Only output the code, wrapped in backticks.")
+            .model("gemini/gemini-flash-lite-latest")
+            .remove_backticks()
+            .await?;
     println!("  Response: {}", resp.text);
     assert!(!resp.text.starts_with("```"));
 
@@ -74,7 +74,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let resp = smolllm::ask("Say 'hook test'")
         .model("gemini/gemini-flash-lite-latest")
         .hook(|event| {
-            println!("  Hook: model={} tokens={}", event.usage.model, event.usage.output_tokens);
+            println!(
+                "  Hook: model={} tokens={}",
+                event.usage.model, event.usage.output_tokens
+            );
         })
         .await?;
     println!("  Response: {}", resp.text);
