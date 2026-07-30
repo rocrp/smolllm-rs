@@ -160,6 +160,120 @@ fn reports_actionable_error_for_unknown_provider_without_base_url() {
 }
 
 #[test]
+fn resolves_bare_model_with_explicit_base_url() {
+    let endpoints = resolve_endpoints("gpt-4", Some("https://gateway.example")).unwrap();
+
+    assert_eq!(endpoints.len(), 1);
+    assert_eq!(
+        endpoints[0].url,
+        "https://gateway.example/v1/chat/completions"
+    );
+    assert_eq!(endpoints[0].provider, "");
+    assert_eq!(endpoints[0].model, "gpt-4");
+}
+
+#[test]
+fn bare_model_uses_generic_url_grammar() {
+    let cases = [
+        (
+            "https://gateway.example/custom#",
+            "https://gateway.example/custom",
+        ),
+        (
+            "https://gateway.example/openai/",
+            "https://gateway.example/openai/chat/completions",
+        ),
+        (
+            "https://gateway.example/v2",
+            "https://gateway.example/v2/chat/completions",
+        ),
+    ];
+
+    for (base_url, expected) in cases {
+        let endpoints = resolve_endpoints("gpt-4", Some(base_url)).unwrap();
+        assert_eq!(endpoints[0].url, expected, "bare with {base_url}");
+    }
+}
+
+#[test]
+fn bare_model_without_base_url_reports_bare_error() {
+    let error = resolve_endpoints("gpt-4", None).unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "missing base URL for bare model 'gpt-4'. Pass base_url or use provider/model format"
+    );
+}
+
+#[test]
+fn bare_model_validation_requires_explicit_api_key() {
+    validate("gpt-4", Some("test-key"), Some("https://gateway.example")).unwrap();
+
+    let error = validate("gpt-4", None, Some("https://gateway.example")).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "missing API key for bare model 'gpt-4'. Pass api_key or use provider/model format"
+    );
+}
+
+#[test]
+fn bare_gemini_is_a_model_named_gemini() {
+    // Bare "gemini" no longer selects the gemini provider or a default model:
+    // it is a model literally named "gemini" using the generic URL grammar.
+    let error = resolve_endpoints("gemini", None).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "missing base URL for bare model 'gemini'. Pass base_url or use provider/model format"
+    );
+
+    let endpoints = resolve_endpoints("gemini", Some("https://gateway.example")).unwrap();
+    assert_eq!(endpoints[0].provider, "");
+    assert_eq!(endpoints[0].model, "gemini");
+    assert_eq!(
+        endpoints[0].url,
+        "https://gateway.example/v1/chat/completions"
+    );
+}
+
+#[test]
+fn rejects_empty_provider_and_empty_model_segments() {
+    let empty_provider = resolve_endpoints("/gpt-4", None).unwrap_err();
+    assert!(matches!(empty_provider, Error::InvalidModel(_)));
+    assert_eq!(
+        empty_provider.to_string(),
+        "invalid model string: missing provider before '/' in '/gpt-4'"
+    );
+
+    let empty_model = resolve_endpoints("gpt-4/", None).unwrap_err();
+    assert!(matches!(empty_model, Error::InvalidModel(_)));
+    assert_eq!(
+        empty_model.to_string(),
+        "invalid model string: missing model name after '/' in 'gpt-4/'"
+    );
+}
+
+#[test]
+fn chains_mix_bare_and_prefixed_legs() {
+    let endpoints =
+        resolve_endpoints("openai/gpt-4o, gpt-4", Some("https://gateway.example/v2")).unwrap();
+
+    assert_eq!(endpoints.len(), 2);
+    assert_eq!(endpoints[0].provider, "openai");
+    assert_eq!(endpoints[0].model, "gpt-4o");
+    assert_eq!(endpoints[1].provider, "");
+    assert_eq!(endpoints[1].model, "gpt-4");
+
+    // ModelInput comma-splitting is upstream of parsing and treats bare legs
+    // like any other leg in the fallback chain.
+    match smolllm::ModelInput::from("openai/gpt-4o, gpt-4") {
+        smolllm::ModelInput::Sequential(models) => {
+            assert_eq!(models, vec!["openai/gpt-4o", "gpt-4"]);
+        }
+        other => panic!("expected Sequential, got {other:?}"),
+    }
+}
+
+#[test]
 fn rejects_empty_base_url_candidates() {
     let error = resolve_endpoints(
         "custom/model",

@@ -12,6 +12,14 @@ pub enum Error {
     #[error("missing base URL for provider '{provider}'. Pass base_url or set {env_var}")]
     MissingBaseUrl { provider: String, env_var: String },
 
+    #[error("missing API key for bare model '{model}'. Pass api_key or use provider/model format")]
+    MissingApiKeyBare { model: String },
+
+    #[error(
+        "missing base URL for bare model '{model}'. Pass base_url or use provider/model format"
+    )]
+    MissingBaseUrlBare { model: String },
+
     #[error("invalid model string: {0}")]
     InvalidModel(String),
 

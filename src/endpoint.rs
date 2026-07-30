@@ -7,7 +7,7 @@ use crate::Error;
 pub struct ResolvedEndpoint {
     /// Full URL that the request will POST to.
     pub url: String,
-    /// Resolved provider name.
+    /// Resolved provider name; empty for bare model names (no `provider/` prefix).
     pub provider: String,
     /// Model name with the provider prefix removed.
     pub model: String,

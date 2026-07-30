@@ -8,85 +8,66 @@ use crate::error::Error;
 pub struct ProviderInfo {
     pub name: &'static str,
     pub base_url: &'static str,
-    pub default_model: Option<&'static str>,
 }
 
-const fn p(
-    name: &'static str,
-    base_url: &'static str,
-    default_model: Option<&'static str>,
-) -> ProviderInfo {
-    ProviderInfo {
-        name,
-        base_url,
-        default_model,
-    }
+const fn p(name: &'static str, base_url: &'static str) -> ProviderInfo {
+    ProviderInfo { name, base_url }
 }
 
 static PROVIDER_LIST: &[ProviderInfo] = &[
-    p("aihubmix", "https://aihubmix.com", None),
-    p("anthropic", "https://api.anthropic.com/", None),
-    p("azure-openai", "", None),
-    p("baichuan", "https://api.baichuan-ai.com", None),
-    p("baidu-cloud", "https://qianfan.baidubce.com/v2/", None),
-    p("cerebras", "https://api.cerebras.ai", None),
+    p("aihubmix", "https://aihubmix.com"),
+    p("anthropic", "https://api.anthropic.com/"),
+    p("azure-openai", ""),
+    p("baichuan", "https://api.baichuan-ai.com"),
+    p("baidu-cloud", "https://qianfan.baidubce.com/v2/"),
+    p("cerebras", "https://api.cerebras.ai"),
     p(
         "dashscope",
         "https://dashscope.aliyuncs.com/compatible-mode/v1/",
-        None,
     ),
-    p("deepseek", "https://api.deepseek.com", None),
-    p("dmxapi", "https://www.dmxapi.cn", None),
-    p("doubao", "https://ark.cn-beijing.volces.com/api/v3/", None),
-    p("fireworks", "https://api.fireworks.ai/inference", None),
-    p(
-        "gemini",
-        "https://generativelanguage.googleapis.com",
-        Some("gemini-2.0-flash"),
-    ),
-    p("gitee-ai", "https://ai.gitee.com", None),
-    p("github", "https://models.inference.ai.azure.com/", None),
-    p("graphrag-kylin-mountain", "", None),
-    p("grok", "https://api.x.ai", None),
-    p("groq", "https://api.groq.com/openai", None),
-    p("hunyuan", "https://api.hunyuan.cloud.tencent.com", None),
-    p("hyperbolic", "https://api.hyperbolic.xyz", None),
-    p("infini", "https://cloud.infini-ai.com/maas", None),
-    p("jina", "https://api.jina.ai", None),
-    p("lmstudio", "http://localhost:1234", None),
-    p("minimax", "https://api.minimax.chat/v1/", None),
-    p("mistral", "https://api.mistral.ai", None),
-    p(
-        "modelscope",
-        "https://api-inference.modelscope.cn/v1/",
-        None,
-    ),
-    p("moonshot", "https://api.moonshot.cn", None),
-    p("nvidia", "https://integrate.api.nvidia.com", None),
-    p("o3", "https://api.o3.fan", None),
-    p("ocoolai", "https://api.ocoolai.com", None),
-    p("ollama", "http://localhost:11434", None),
-    p("openai", "https://api.openai.com", None),
-    p("openrouter", "https://openrouter.ai/api/v1/", None),
-    p("perplexity", "https://api.perplexity.ai/", None),
-    p("ppio", "https://api.ppinfra.com/v3/openai", None),
-    p("silicon", "https://api.siliconflow.cn", None),
-    p("stepfun", "https://api.stepfun.com", None),
-    p(
-        "tencent-cloud-ti",
-        "https://api.lkeap.cloud.tencent.com",
-        None,
-    ),
-    p("together", "https://api.together.xyz", None),
-    p("xirang", "https://wishub-x1.ctyun.cn", None),
-    p("yi", "https://api.lingyiwanwu.com", None),
-    p("zhinao", "https://api.360.cn", None),
-    p("zhipu", "https://open.bigmodel.cn/api/paas/v4/", None),
+    p("deepseek", "https://api.deepseek.com"),
+    p("dmxapi", "https://www.dmxapi.cn"),
+    p("doubao", "https://ark.cn-beijing.volces.com/api/v3/"),
+    p("fireworks", "https://api.fireworks.ai/inference"),
+    p("gemini", "https://generativelanguage.googleapis.com"),
+    p("gitee-ai", "https://ai.gitee.com"),
+    p("github", "https://models.inference.ai.azure.com/"),
+    p("graphrag-kylin-mountain", ""),
+    p("grok", "https://api.x.ai"),
+    p("groq", "https://api.groq.com/openai"),
+    p("hunyuan", "https://api.hunyuan.cloud.tencent.com"),
+    p("hyperbolic", "https://api.hyperbolic.xyz"),
+    p("infini", "https://cloud.infini-ai.com/maas"),
+    p("jina", "https://api.jina.ai"),
+    p("lmstudio", "http://localhost:1234"),
+    p("minimax", "https://api.minimax.chat/v1/"),
+    p("mistral", "https://api.mistral.ai"),
+    p("modelscope", "https://api-inference.modelscope.cn/v1/"),
+    p("moonshot", "https://api.moonshot.cn"),
+    p("nvidia", "https://integrate.api.nvidia.com"),
+    p("o3", "https://api.o3.fan"),
+    p("ocoolai", "https://api.ocoolai.com"),
+    p("ollama", "http://localhost:11434"),
+    p("openai", "https://api.openai.com"),
+    p("openrouter", "https://openrouter.ai/api/v1/"),
+    p("perplexity", "https://api.perplexity.ai/"),
+    p("ppio", "https://api.ppinfra.com/v3/openai"),
+    p("silicon", "https://api.siliconflow.cn"),
+    p("stepfun", "https://api.stepfun.com"),
+    p("tencent-cloud-ti", "https://api.lkeap.cloud.tencent.com"),
+    p("together", "https://api.together.xyz"),
+    p("xirang", "https://wishub-x1.ctyun.cn"),
+    p("yi", "https://api.lingyiwanwu.com"),
+    p("zhinao", "https://api.360.cn"),
+    p("zhipu", "https://open.bigmodel.cn/api/paas/v4/"),
 ];
 
 static PROVIDERS: LazyLock<HashMap<&'static str, &'static ProviderInfo>> =
     LazyLock::new(|| PROVIDER_LIST.iter().map(|info| (info.name, info)).collect());
 
+/// A parsed model specification. `provider_name` is empty for bare model
+/// names (no `/` in the input); bare models resolve only against explicit
+/// base URLs and API keys — never environment variables.
 #[derive(Debug, Clone)]
 pub struct ParsedModel {
     pub provider_name: String,
@@ -100,33 +81,35 @@ pub fn parse_model_string(model: &str) -> Result<ParsedModel, Error> {
         return Err(Error::InvalidModel("model string must not be empty".into()));
     }
 
-    let (provider_name, raw_model_name) = match model.split_once('/') {
-        Some((prov, name)) => (prov.to_string(), name.trim().to_string()),
-        None => (model.to_string(), String::new()),
+    let Some((provider_name, raw_model_name)) = model.split_once('/') else {
+        // Bare model name: no provider.
+        return Ok(ParsedModel {
+            provider_name: String::new(),
+            model_name: model.to_string(),
+            base_url: String::new(),
+        });
     };
 
-    let (base_url, model_name) = if let Some(info) = PROVIDERS.get(provider_name.as_str()) {
-        let model_name = if raw_model_name.is_empty() {
-            info.default_model.map(str::to_string).ok_or_else(|| {
-                Error::InvalidModel(format!("model name missing for provider '{provider_name}'"))
-            })?
-        } else {
-            raw_model_name
-        };
-        (info.base_url.to_string(), model_name)
-    } else {
-        if raw_model_name.is_empty() {
-            return Err(Error::InvalidModel(format!(
-                "model name missing for provider '{provider_name}'"
-            )));
-        }
-        (String::new(), raw_model_name)
-    };
+    if provider_name.is_empty() {
+        return Err(Error::InvalidModel(format!(
+            "missing provider before '/' in '{model}'"
+        )));
+    }
+    let model_name = raw_model_name.trim();
+    if model_name.is_empty() {
+        return Err(Error::InvalidModel(format!(
+            "missing model name after '/' in '{model}'"
+        )));
+    }
+
+    let base_url = PROVIDERS
+        .get(provider_name)
+        .map_or("", |info| info.base_url);
 
     Ok(ParsedModel {
-        provider_name,
-        model_name,
-        base_url,
+        provider_name: provider_name.to_string(),
+        model_name: model_name.to_string(),
+        base_url: base_url.to_string(),
     })
 }
 
@@ -136,6 +119,12 @@ pub fn resolve_base_url(parsed: &ParsedModel, explicit: Option<&str>) -> Result<
         if !url.is_empty() {
             return Ok(url.to_string());
         }
+    }
+
+    if parsed.provider_name.is_empty() {
+        return Err(Error::MissingBaseUrlBare {
+            model: parsed.model_name.clone(),
+        });
     }
 
     let env_key = provider_env_key(&parsed.provider_name, "BASE_URL");
@@ -162,6 +151,12 @@ pub fn resolve_api_key(parsed: &ParsedModel, explicit: Option<&str>) -> Result<S
         if !key.is_empty() {
             return Ok(key.to_string());
         }
+    }
+
+    if parsed.provider_name.is_empty() {
+        return Err(Error::MissingApiKeyBare {
+            model: parsed.model_name.clone(),
+        });
     }
 
     let env_key = provider_env_key(&parsed.provider_name, "API_KEY");
@@ -237,19 +232,99 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_model_default() {
-        let parsed = parse_model_string("gemini").unwrap();
-        assert_eq!(parsed.model_name, "gemini-2.0-flash");
-    }
-
-    #[test]
     fn test_parse_model_empty() {
         assert!(parse_model_string("").is_err());
     }
 
     #[test]
-    fn test_parse_model_no_default() {
-        assert!(parse_model_string("openai").is_err());
+    fn test_parse_bare_model_has_no_provider() {
+        // Even names matching known providers are plain model names when bare.
+        for bare in ["gpt-4", "gemini", "openai", "ollama"] {
+            let parsed = parse_model_string(bare).unwrap();
+            assert_eq!(parsed.provider_name, "");
+            assert_eq!(parsed.model_name, bare);
+            assert!(parsed.base_url.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_parse_rejects_empty_provider_or_model() {
+        assert_eq!(
+            parse_model_string("/gpt-4").unwrap_err().to_string(),
+            "invalid model string: missing provider before '/' in '/gpt-4'"
+        );
+        assert_eq!(
+            parse_model_string("gpt-4/").unwrap_err().to_string(),
+            "invalid model string: missing model name after '/' in 'gpt-4/'"
+        );
+    }
+
+    #[test]
+    fn test_bare_model_resolves_only_explicit_base_url() {
+        let parsed = parse_model_string("gpt-4").unwrap();
+        assert_eq!(
+            resolve_base_url(&parsed, Some(" https://my.host ")).unwrap(),
+            "https://my.host"
+        );
+        assert_eq!(
+            resolve_base_url(&parsed, None).unwrap_err().to_string(),
+            "missing base URL for bare model 'gpt-4'. Pass base_url or use provider/model format"
+        );
+    }
+
+    #[test]
+    fn test_bare_model_resolves_only_explicit_api_key() {
+        let parsed = parse_model_string("gpt-4").unwrap();
+        assert_eq!(
+            resolve_api_key(&parsed, Some(" sk-key ")).unwrap(),
+            "sk-key"
+        );
+        assert_eq!(
+            resolve_api_key(&parsed, None).unwrap_err().to_string(),
+            "missing API key for bare model 'gpt-4'. Pass api_key or use provider/model format"
+        );
+    }
+
+    #[test]
+    fn test_bare_model_never_reads_underscore_env_vars() {
+        // provider_env_key("") would yield "_BASE_URL"/"_API_KEY"; bare mode
+        // must error before any env lookup happens.
+        let previous_url = env::var_os("_BASE_URL");
+        let previous_key = env::var_os("_API_KEY");
+        env::set_var("_BASE_URL", "https://env.host");
+        env::set_var("_API_KEY", "env-key");
+
+        let parsed = parse_model_string("gpt-4").unwrap();
+        let base_url = resolve_base_url(&parsed, None);
+        let api_key = resolve_api_key(&parsed, None);
+
+        for (var, previous) in [("_BASE_URL", previous_url), ("_API_KEY", previous_key)] {
+            if let Some(value) = previous {
+                env::set_var(var, value);
+            } else {
+                env::remove_var(var);
+            }
+        }
+
+        assert!(matches!(
+            base_url.unwrap_err(),
+            Error::MissingBaseUrlBare { model } if model == "gpt-4"
+        ));
+        assert!(matches!(
+            api_key.unwrap_err(),
+            Error::MissingApiKeyBare { model } if model == "gpt-4"
+        ));
+    }
+
+    #[test]
+    fn test_bare_ollama_gets_no_literal_key() {
+        // The ollama literal-key fallback applies to the ollama provider only,
+        // never to a bare model that happens to be named "ollama".
+        let parsed = parse_model_string("ollama").unwrap();
+        assert!(matches!(
+            resolve_api_key(&parsed, None).unwrap_err(),
+            Error::MissingApiKeyBare { model } if model == "ollama"
+        ));
     }
 
     #[test]
