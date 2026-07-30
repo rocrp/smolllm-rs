@@ -201,35 +201,28 @@ fn has_version_suffix(url: &str) -> bool {
 
 pub fn build_request_url(base_url: &str, provider_name: &str) -> String {
     let base = base_url.trim();
+    let endpoint = "chat/completions";
+    let provider_version = match provider_name {
+        "anthropic" => Some("v1"),
+        "gemini" => Some("v1beta/openai"),
+        _ => None,
+    };
 
-    match provider_name {
-        "anthropic" => {
-            let stripped = base.trim_end_matches('/');
-            if has_version_suffix(stripped) {
-                format!("{stripped}/chat/completions")
-            } else {
-                format!("{stripped}/v1/chat/completions")
-            }
+    if let Some(version) = provider_version {
+        let stripped = base.trim_end_matches('/');
+        if has_version_suffix(stripped) {
+            format!("{stripped}/{endpoint}")
+        } else {
+            format!("{stripped}/{version}/{endpoint}")
         }
-        "gemini" => {
-            let stripped = base.trim_end_matches('/');
-            if has_version_suffix(stripped) {
-                format!("{stripped}/chat/completions")
-            } else {
-                format!("{stripped}/v1beta/openai/chat/completions")
-            }
-        }
-        _ => {
-            if base.ends_with('#') {
-                base.trim_end_matches('#').to_string()
-            } else if base.ends_with('/') {
-                format!("{base}chat/completions")
-            } else if has_version_suffix(base) {
-                format!("{base}/chat/completions")
-            } else {
-                format!("{base}/v1/chat/completions")
-            }
-        }
+    } else if base.ends_with('#') {
+        base.trim_end_matches('#').to_string()
+    } else if base.ends_with('/') {
+        format!("{base}{endpoint}")
+    } else if has_version_suffix(base) {
+        format!("{base}/{endpoint}")
+    } else {
+        format!("{base}/v1/{endpoint}")
     }
 }
 
