@@ -1,6 +1,5 @@
 use crate::provider::{build_request_url, parse_model_string, resolve_base_url, ParsedModel};
-use crate::selector::ModelInput;
-use crate::utils::parse_comma_list;
+use crate::utils::{parse_base_url_list, parse_model_list};
 use crate::Error;
 
 /// The concrete request target resolved from a model specification.
@@ -16,7 +15,7 @@ pub struct ResolvedEndpoint {
 
 pub(crate) struct ResolvedModel {
     pub parsed: ParsedModel,
-    pub base_urls: String,
+    pub base_urls: Vec<String>,
 }
 
 impl ResolvedModel {
@@ -27,11 +26,21 @@ impl ResolvedModel {
             model: self.parsed.model_name.clone(),
         }
     }
+
+    fn into_endpoint(self) -> Result<ResolvedEndpoint, Error> {
+        if self.base_urls.len() != 1 {
+            return Err(Error::AmbiguousBaseUrls {
+                provider: self.parsed.provider_name.clone(),
+                candidates: self.base_urls.len(),
+            });
+        }
+        Ok(self.endpoint_for(&self.base_urls[0]))
+    }
 }
 
 pub(crate) fn resolve_model(model: &str, base_url: Option<&str>) -> Result<ResolvedModel, Error> {
     let parsed = parse_model_string(model)?;
-    let base_urls = resolve_base_url(&parsed, base_url)?;
+    let base_urls = parse_base_url_list(&resolve_base_url(&parsed, base_url)?)?;
     Ok(ResolvedModel { parsed, base_urls })
 }
 
@@ -39,10 +48,9 @@ pub(crate) fn resolve_models(
     model: &str,
     base_url: Option<&str>,
 ) -> Result<Vec<ResolvedModel>, Error> {
-    let mut selector = ModelInput::from(model).into_selector();
     let mut resolved_models = Vec::new();
 
-    while let Some(model) = selector.next_model() {
+    for model in parse_model_list(model)? {
         resolved_models.push(resolve_model(&model, base_url)?);
     }
 
@@ -58,9 +66,6 @@ pub fn resolve_endpoints(
     let models = resolve_models(model, base_url)?;
     models
         .into_iter()
-        .map(|resolved| {
-            let base_urls = parse_comma_list(&resolved.base_urls)?;
-            Ok(resolved.endpoint_for(&base_urls[0]))
-        })
+        .map(ResolvedModel::into_endpoint)
         .collect()
 }

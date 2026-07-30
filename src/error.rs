@@ -15,6 +15,21 @@ pub enum Error {
     #[error("invalid model string: {0}")]
     InvalidModel(String),
 
+    #[error("invalid model list: {reason}")]
+    InvalidModelList { reason: String },
+
+    #[error("invalid API key list: {reason}")]
+    InvalidApiKeyList { reason: String },
+
+    #[error("invalid base URL list: {reason}")]
+    InvalidBaseUrlList { reason: String },
+
+    #[error(
+        "cannot resolve one endpoint for provider '{provider}': \
+         found {candidates} base URL candidates; pass a single base_url"
+    )]
+    AmbiguousBaseUrls { provider: String, candidates: usize },
+
     #[error("invalid parameter: {0}")]
     InvalidParam(String),
 

@@ -4,7 +4,6 @@ use std::sync::{LazyLock, Mutex};
 use rand::prelude::IndexedRandom;
 
 use crate::error::Error;
-use crate::utils::parse_comma_list;
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct PairKey {
@@ -22,7 +21,7 @@ static BALANCER: LazyLock<Mutex<BalancerState>> = LazyLock::new(|| {
     })
 });
 
-pub fn choose_pair(keys: &str, urls: &str) -> Result<(String, String), Error> {
+pub fn choose_pair(keys: &[String], urls: &[String]) -> Result<(String, String), Error> {
     let pairs = build_pairs(keys, urls)?;
 
     let mut state = BALANCER.lock().unwrap();
@@ -48,7 +47,7 @@ pub fn choose_pair(keys: &str, urls: &str) -> Result<(String, String), Error> {
     Ok((chosen.key.clone(), chosen.url.clone()))
 }
 
-pub(crate) fn validate_pairs(keys: &str, urls: &str) -> Result<(), Error> {
+pub(crate) fn validate_pairs(keys: &[String], urls: &[String]) -> Result<(), Error> {
     build_pairs(keys, urls).map(|_| ())
 }
 
@@ -67,28 +66,39 @@ pub(crate) fn usage_for(key: &str, url: &str) -> usize {
         .unwrap_or(0)
 }
 
-fn build_pairs(keys: &str, urls: &str) -> Result<Vec<PairKey>, Error> {
-    let key_list = parse_comma_list(keys)?;
-    let url_list = parse_comma_list(urls)?;
+fn build_pairs(keys: &[String], urls: &[String]) -> Result<Vec<PairKey>, Error> {
+    if keys.is_empty() {
+        return Err(Error::InvalidApiKeyList {
+            reason: "value must not be empty".into(),
+        });
+    }
+    if urls.is_empty() {
+        return Err(Error::InvalidBaseUrlList {
+            reason: "value must not be empty".into(),
+        });
+    }
 
-    match (key_list.len(), url_list.len()) {
-        (_, 1) => Ok(key_list
-            .into_iter()
+    match (keys.len(), urls.len()) {
+        (_, 1) => Ok(keys
+            .iter()
+            .cloned()
             .map(|k| PairKey {
                 key: k,
-                url: url_list[0].clone(),
+                url: urls[0].clone(),
             })
             .collect()),
-        (1, _) => Ok(url_list
-            .into_iter()
+        (1, _) => Ok(urls
+            .iter()
+            .cloned()
             .map(|u| PairKey {
-                key: key_list[0].clone(),
+                key: keys[0].clone(),
                 url: u,
             })
             .collect()),
-        (kn, un) if kn == un => Ok(key_list
-            .into_iter()
-            .zip(url_list)
+        (kn, un) if kn == un => Ok(keys
+            .iter()
+            .cloned()
+            .zip(urls.iter().cloned())
             .map(|(k, u)| PairKey { key: k, url: u })
             .collect()),
         (kn, un) => Err(Error::MismatchedPairs { keys: kn, urls: un }),
@@ -99,23 +109,31 @@ fn build_pairs(keys: &str, urls: &str) -> Result<Vec<PairKey>, Error> {
 mod tests {
     use super::*;
 
+    fn list(items: &[&str]) -> Vec<String> {
+        items.iter().map(ToString::to_string).collect()
+    }
+
     #[test]
     fn test_build_pairs_single_url() {
-        let pairs = build_pairs("key1,key2", "https://api.example.com").unwrap();
+        let pairs = build_pairs(
+            &list(&["key1", "key2"]),
+            &list(&["https://api.example.com"]),
+        )
+        .unwrap();
         assert_eq!(pairs.len(), 2);
         assert_eq!(pairs[0].url, pairs[1].url);
     }
 
     #[test]
     fn test_build_pairs_single_key() {
-        let pairs = build_pairs("key1", "url1,url2").unwrap();
+        let pairs = build_pairs(&list(&["key1"]), &list(&["url1", "url2"])).unwrap();
         assert_eq!(pairs.len(), 2);
         assert_eq!(pairs[0].key, pairs[1].key);
     }
 
     #[test]
     fn test_build_pairs_matched() {
-        let pairs = build_pairs("k1,k2", "u1,u2").unwrap();
+        let pairs = build_pairs(&list(&["k1", "k2"]), &list(&["u1", "u2"])).unwrap();
         assert_eq!(pairs.len(), 2);
         assert_eq!(pairs[0].key, "k1");
         assert_eq!(pairs[0].url, "u1");
@@ -125,13 +143,15 @@ mod tests {
 
     #[test]
     fn test_build_pairs_mismatch() {
-        assert!(build_pairs("k1,k2", "u1,u2,u3").is_err());
+        assert!(build_pairs(&list(&["k1", "k2"]), &list(&["u1", "u2", "u3"])).is_err());
     }
 
     #[test]
     fn test_choose_pair_round_robin() {
-        let (k1, _) = choose_pair("key1,key2", "url1").unwrap();
-        let (k2, _) = choose_pair("key1,key2", "url1").unwrap();
+        let keys = list(&["key1", "key2"]);
+        let urls = list(&["url1"]);
+        let (k1, _) = choose_pair(&keys, &urls).unwrap();
+        let (k2, _) = choose_pair(&keys, &urls).unwrap();
         assert_ne!(k1, k2);
     }
 }

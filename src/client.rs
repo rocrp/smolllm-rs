@@ -118,8 +118,11 @@ pub(crate) struct Dispatch {
 impl Dispatch {
     fn prepare(model_str: &str, config: &RequestConfig) -> Result<Self, Error> {
         let resolved = resolve_model(model_str, config.base_url.as_deref())?;
-        let api_key = resolve_api_key(&resolved.parsed, config.api_key.as_deref())?;
-        let (chosen_key, chosen_url) = balancer::choose_pair(&api_key, &resolved.base_urls)?;
+        let api_keys = parse_api_key_list(&resolve_api_key(
+            &resolved.parsed,
+            config.api_key.as_deref(),
+        )?)?;
+        let (chosen_key, chosen_url) = balancer::choose_pair(&api_keys, &resolved.base_urls)?;
         let request_url = resolved.endpoint_for(&chosen_url).url;
         let parsed = resolved.parsed;
         let body = build_request_body(&parsed.model_name, config)?;

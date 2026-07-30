@@ -28,12 +28,10 @@ pub fn stream(prompt: impl Into<Prompt>) -> StreamBuilder {
 }
 
 pub fn validate(model: &str, api_key: Option<&str>, base_url: Option<&str>) -> Result<(), Error> {
-    let mut selector = ModelInput::from(model).into_selector();
-
-    while let Some(model) = selector.next_model() {
-        let resolved = endpoint::resolve_model(&model, base_url)?;
-        let resolved_key = provider::resolve_api_key(&resolved.parsed, api_key)?;
-        balancer::validate_pairs(&resolved_key, &resolved.base_urls)?;
+    for resolved in endpoint::resolve_models(model, base_url)? {
+        let resolved_keys =
+            utils::parse_api_key_list(&provider::resolve_api_key(&resolved.parsed, api_key)?)?;
+        balancer::validate_pairs(&resolved_keys, &resolved.base_urls)?;
     }
 
     Ok(())

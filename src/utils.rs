@@ -2,19 +2,31 @@ use std::time::Duration;
 
 use crate::Error;
 
-pub fn parse_comma_list(items: &str) -> Result<Vec<String>, Error> {
+fn split_comma_list(items: &str) -> Result<Vec<String>, String> {
     let items = items.trim();
     if items.is_empty() {
-        return Err(Error::Other("value must not be empty".into()));
+        return Err("value must not be empty".into());
     }
     let result: Vec<String> = items
         .split(',')
         .map(|item| item.trim().to_string())
         .collect();
     if result.iter().any(String::is_empty) {
-        return Err(Error::Other("list contains empty entry".into()));
+        return Err("list contains empty entry".into());
     }
     Ok(result)
+}
+
+pub fn parse_model_list(items: &str) -> Result<Vec<String>, Error> {
+    split_comma_list(items).map_err(|reason| Error::InvalidModelList { reason })
+}
+
+pub fn parse_api_key_list(items: &str) -> Result<Vec<String>, Error> {
+    split_comma_list(items).map_err(|reason| Error::InvalidApiKeyList { reason })
+}
+
+pub fn parse_base_url_list(items: &str) -> Result<Vec<String>, Error> {
+    split_comma_list(items).map_err(|reason| Error::InvalidBaseUrlList { reason })
 }
 
 pub fn estimate_tokens(text: &str) -> usize {
