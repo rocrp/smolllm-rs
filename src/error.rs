@@ -9,7 +9,7 @@ pub enum Error {
     #[error("missing API key for provider '{provider}'. Set {env_var} or use .api_key()")]
     MissingApiKey { provider: String, env_var: String },
 
-    #[error("missing base URL for provider '{provider}'. Set {env_var} or use .base_url()")]
+    #[error("missing base URL for provider '{provider}'. Pass base_url or set {env_var}")]
     MissingBaseUrl { provider: String, env_var: String },
 
     #[error("invalid model string: {0}")]

@@ -115,19 +115,12 @@ pub fn parse_model_string(model: &str) -> Result<ParsedModel, Error> {
         };
         (info.base_url.to_string(), model_name)
     } else {
-        let env_key = provider_env_key(&provider_name, "BASE_URL");
-        let env_val = env::var(&env_key).unwrap_or_default();
-        if env_val.trim().is_empty() {
-            return Err(Error::InvalidModel(format!(
-                "unknown provider '{provider_name}' and {env_key} not set"
-            )));
-        }
         if raw_model_name.is_empty() {
             return Err(Error::InvalidModel(format!(
                 "model name missing for provider '{provider_name}'"
             )));
         }
-        (env_val, raw_model_name)
+        (String::new(), raw_model_name)
     };
 
     Ok(ParsedModel {
@@ -257,6 +250,68 @@ mod tests {
     #[test]
     fn test_parse_model_no_default() {
         assert!(parse_model_string("openai").is_err());
+    }
+
+    #[test]
+    fn test_unknown_provider_resolves_explicit_base_url() {
+        let parsed = parse_model_string("smolllm-issue-2-explicit/qwen3").unwrap();
+
+        assert_eq!(parsed.provider_name, "smolllm-issue-2-explicit");
+        assert_eq!(parsed.model_name, "qwen3");
+        assert!(parsed.base_url.is_empty());
+        assert_eq!(
+            resolve_base_url(&parsed, Some(" https://my.host ")).unwrap(),
+            "https://my.host"
+        );
+    }
+
+    #[test]
+    fn test_unknown_provider_env_is_read_only_during_resolution() {
+        let provider_name = "smolllm-issue-2-env";
+        let env_key = provider_env_key(provider_name, "BASE_URL");
+        let previous = env::var_os(&env_key);
+        env::set_var(&env_key, " https://env.host ");
+
+        let parsed = parse_model_string(&format!("{provider_name}/qwen3"));
+        let resolved = parsed
+            .as_ref()
+            .map_err(ToString::to_string)
+            .and_then(|parsed| resolve_base_url(parsed, None).map_err(|err| err.to_string()));
+
+        if let Some(value) = previous {
+            env::set_var(&env_key, value);
+        } else {
+            env::remove_var(&env_key);
+        }
+
+        let parsed = parsed.unwrap();
+        assert!(
+            parsed.base_url.is_empty(),
+            "model parsing must not read {env_key}"
+        );
+        assert_eq!(resolved.unwrap(), "https://env.host");
+    }
+
+    #[test]
+    fn test_unknown_provider_error_names_both_base_url_remedies() {
+        let provider_name = "smolllm-issue-2-missing";
+        let env_key = provider_env_key(provider_name, "BASE_URL");
+        let previous = env::var_os(&env_key);
+        env::remove_var(&env_key);
+
+        let result = parse_model_string(&format!("{provider_name}/qwen3"))
+            .and_then(|parsed| resolve_base_url(&parsed, None));
+
+        if let Some(value) = previous {
+            env::set_var(&env_key, value);
+        }
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            format!(
+                "missing base URL for provider '{provider_name}'. Pass base_url or set {env_key}"
+            )
+        );
     }
 
     #[test]

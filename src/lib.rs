@@ -38,3 +38,18 @@ pub fn validate(model: &str, api_key: Option<&str>, base_url: Option<&str>) -> R
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_accepts_unknown_provider_with_explicit_base_url() {
+        assert!(validate(
+            "smolllm-issue-2-validate/qwen3",
+            Some("test-key"),
+            Some("https://my.host"),
+        )
+        .is_ok());
+    }
+}
