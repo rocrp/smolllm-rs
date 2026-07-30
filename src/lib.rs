@@ -1,6 +1,7 @@
 mod balancer;
 mod builder;
 mod client;
+mod endpoint;
 mod error;
 mod image;
 mod provider;
@@ -12,6 +13,7 @@ mod utils;
 
 pub use builder::{AskBuilder, StreamBuilder};
 pub use client::StreamResponse;
+pub use endpoint::{resolve_endpoints, ResolvedEndpoint};
 pub use error::Error;
 pub use selector::ModelInput;
 pub use think::extract_think_tags;
@@ -26,14 +28,12 @@ pub fn stream(prompt: impl Into<Prompt>) -> StreamBuilder {
 }
 
 pub fn validate(model: &str, api_key: Option<&str>, base_url: Option<&str>) -> Result<(), Error> {
-    let input = ModelInput::from(model);
-    let mut selector = input.into_selector();
+    let mut selector = ModelInput::from(model).into_selector();
 
-    while let Some(model_str) = selector.next_model() {
-        let parsed = provider::parse_model_string(&model_str)?;
-        let resolved_url = provider::resolve_base_url(&parsed, base_url)?;
-        let resolved_key = provider::resolve_api_key(&parsed, api_key)?;
-        balancer::choose_pair(&resolved_key, &resolved_url)?;
+    while let Some(model) = selector.next_model() {
+        let resolved = endpoint::resolve_model(&model, base_url)?;
+        let resolved_key = provider::resolve_api_key(&resolved.parsed, api_key)?;
+        balancer::validate_pairs(&resolved_key, &resolved.base_urls)?;
     }
 
     Ok(())
@@ -51,5 +51,20 @@ mod tests {
             Some("https://my.host"),
         )
         .is_ok());
+    }
+
+    #[test]
+    fn endpoint_resolution_and_validation_do_not_change_balancer_usage() {
+        let model = "smolllm-issue-3-state/model";
+        let api_key = "smolllm-issue-3-key";
+        let base_url = "https://issue-3.example/v2";
+        let usage_before = balancer::usage_for(api_key, base_url);
+
+        for _ in 0..3 {
+            resolve_endpoints(model, Some(base_url)).unwrap();
+            validate(model, Some(api_key), Some(base_url)).unwrap();
+        }
+
+        assert_eq!(balancer::usage_for(api_key, base_url), usage_before);
     }
 }

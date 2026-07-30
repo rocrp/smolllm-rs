@@ -1,5 +1,22 @@
 use std::time::Duration;
 
+use crate::Error;
+
+pub fn parse_comma_list(items: &str) -> Result<Vec<String>, Error> {
+    let items = items.trim();
+    if items.is_empty() {
+        return Err(Error::Other("value must not be empty".into()));
+    }
+    let result: Vec<String> = items
+        .split(',')
+        .map(|item| item.trim().to_string())
+        .collect();
+    if result.iter().any(String::is_empty) {
+        return Err(Error::Other("list contains empty entry".into()));
+    }
+    Ok(result)
+}
+
 pub fn estimate_tokens(text: &str) -> usize {
     if text.is_empty() {
         0

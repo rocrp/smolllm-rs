@@ -10,11 +10,10 @@ use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 
 use crate::balancer;
+use crate::endpoint::resolve_model;
 use crate::error::Error;
 use crate::image::image_to_data_url;
-use crate::provider::{
-    build_request_url, parse_model_string, resolve_api_key, resolve_base_url, ParsedModel,
-};
+use crate::provider::{resolve_api_key, ParsedModel};
 use crate::request::RequestConfig;
 use crate::think::ThinkTagFilter;
 use crate::types::*;
@@ -118,11 +117,11 @@ pub(crate) struct Dispatch {
 
 impl Dispatch {
     fn prepare(model_str: &str, config: &RequestConfig) -> Result<Self, Error> {
-        let parsed = parse_model_string(model_str)?;
-        let base_url = resolve_base_url(&parsed, config.base_url.as_deref())?;
-        let api_key = resolve_api_key(&parsed, config.api_key.as_deref())?;
-        let (chosen_key, chosen_url) = balancer::choose_pair(&api_key, &base_url)?;
-        let request_url = build_request_url(&chosen_url, &parsed.provider_name);
+        let resolved = resolve_model(model_str, config.base_url.as_deref())?;
+        let api_key = resolve_api_key(&resolved.parsed, config.api_key.as_deref())?;
+        let (chosen_key, chosen_url) = balancer::choose_pair(&api_key, &resolved.base_urls)?;
+        let request_url = resolved.endpoint_for(&chosen_url).url;
+        let parsed = resolved.parsed;
         let body = build_request_body(&parsed.model_name, config)?;
         let input_tokens = estimate_tokens(&serde_json::to_string(&body).unwrap_or_default());
         Ok(Self {
@@ -528,7 +527,16 @@ async fn process_sse_task(
     let mut parser = SseParser::new();
     tokio::pin!(byte_stream);
 
-    while let Some(result) = byte_stream.next().await {
+    loop {
+        let result = tokio::select! {
+            biased;
+            _ = tx.closed() => return,
+            result = byte_stream.next() => result,
+        };
+        let Some(result) = result else {
+            break;
+        };
+
         match result {
             Ok(bytes) => {
                 for chunk_result in parser.feed(&bytes) {
@@ -676,3 +684,6 @@ impl HasUsage for StreamResponse {
         StreamResponse::usage(self)
     }
 }
+
+#[cfg(test)]
+mod tests;

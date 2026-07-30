@@ -4,6 +4,7 @@ use std::sync::{LazyLock, Mutex};
 use rand::prelude::IndexedRandom;
 
 use crate::error::Error;
+use crate::utils::parse_comma_list;
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct PairKey {
@@ -47,9 +48,28 @@ pub fn choose_pair(keys: &str, urls: &str) -> Result<(String, String), Error> {
     Ok((chosen.key.clone(), chosen.url.clone()))
 }
 
+pub(crate) fn validate_pairs(keys: &str, urls: &str) -> Result<(), Error> {
+    build_pairs(keys, urls).map(|_| ())
+}
+
+#[cfg(test)]
+pub(crate) fn usage_for(key: &str, url: &str) -> usize {
+    let pair = PairKey {
+        key: key.to_string(),
+        url: url.to_string(),
+    };
+    BALANCER
+        .lock()
+        .unwrap()
+        .usage
+        .get(&pair)
+        .copied()
+        .unwrap_or(0)
+}
+
 fn build_pairs(keys: &str, urls: &str) -> Result<Vec<PairKey>, Error> {
-    let key_list = parse_list(keys)?;
-    let url_list = parse_list(urls)?;
+    let key_list = parse_comma_list(keys)?;
+    let url_list = parse_comma_list(urls)?;
 
     match (key_list.len(), url_list.len()) {
         (_, 1) => Ok(key_list
@@ -73,18 +93,6 @@ fn build_pairs(keys: &str, urls: &str) -> Result<Vec<PairKey>, Error> {
             .collect()),
         (kn, un) => Err(Error::MismatchedPairs { keys: kn, urls: un }),
     }
-}
-
-fn parse_list(items: &str) -> Result<Vec<String>, Error> {
-    let items = items.trim();
-    if items.is_empty() {
-        return Err(Error::Other("value must not be empty".into()));
-    }
-    let result: Vec<String> = items.split(',').map(|s| s.trim().to_string()).collect();
-    if result.iter().any(|s| s.is_empty()) {
-        return Err(Error::Other("list contains empty entry".into()));
-    }
-    Ok(result)
 }
 
 #[cfg(test)]
