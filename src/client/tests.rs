@@ -160,3 +160,151 @@ fn null_content_delta_is_not_an_error() {
     );
     assert!(results.is_empty(), "an empty delta yields no chunk");
 }
+
+// --- rs#5: tool calls -------------------------------------------------------
+
+use crate::toolcall::{ToolCall, ToolCallFunction};
+
+fn feed_frame(parser: &mut SseParser, payload: &str) -> Vec<Result<crate::StreamChunk, crate::Error>> {
+    parser.feed(format!("data: {payload}\n").as_bytes())
+}
+
+#[test]
+fn accumulator_merges_argument_fragments() {
+    let mut parser = SseParser::new();
+    feed_frame(
+        &mut parser,
+        r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":""}}]}}]}"#,
+    );
+    feed_frame(
+        &mut parser,
+        r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"ci"}}]}}]}"#,
+    );
+    feed_frame(
+        &mut parser,
+        r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ty\":\"Paris\"}"}}]}}]}"#,
+    );
+
+    let calls = parser.tool_calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].id, "call_1");
+    assert_eq!(calls[0].kind, "function");
+    assert_eq!(calls[0].function.name, "get_weather");
+    assert_eq!(calls[0].function.arguments, r#"{"city":"Paris"}"#);
+}
+
+#[test]
+fn accumulator_keeps_parallel_calls_ordered() {
+    let mut parser = SseParser::new();
+    feed_frame(
+        &mut parser,
+        r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"b","type":"function","function":{"name":"second"}},{"index":0,"id":"a","type":"function","function":{"name":"first"}}]}}]}"#,
+    );
+    feed_frame(
+        &mut parser,
+        r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]}}]}"#,
+    );
+
+    let calls = parser.tool_calls();
+    assert_eq!(
+        calls.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+        vec!["a", "b"]
+    );
+    assert_eq!(calls[0].function.arguments, "{}");
+}
+
+#[test]
+fn accumulator_without_index_starts_new_call_on_id() {
+    let mut parser = SseParser::new();
+    feed_frame(
+        &mut parser,
+        r#"{"choices":[{"delta":{"tool_calls":[{"id":"a","type":"function","function":{"name":"f"}}]}}]}"#,
+    );
+    feed_frame(
+        &mut parser,
+        r#"{"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"{\"x\":1}"}}]}}]}"#,
+    );
+    feed_frame(
+        &mut parser,
+        r#"{"choices":[{"delta":{"tool_calls":[{"id":"b","type":"function","function":{"name":"g"}}]}}]}"#,
+    );
+
+    let calls = parser.tool_calls();
+    assert_eq!(
+        calls.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+        vec!["a", "b"]
+    );
+    assert_eq!(calls[0].function.arguments, r#"{"x":1}"#);
+}
+
+#[test]
+fn accumulator_keeps_provider_extras() {
+    let mut parser = SseParser::new();
+    feed_frame(
+        &mut parser,
+        r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c","type":"function","function":{"name":"f","arguments":"{}"},"extra_content":{"google":{"thought_signature":"sig"}}}]}}]}"#,
+    );
+
+    let calls = parser.tool_calls();
+    assert_eq!(
+        calls[0].extra.get("extra_content"),
+        Some(&json!({"google":{"thought_signature":"sig"}}))
+    );
+}
+
+#[test]
+fn tool_call_deltas_are_never_forwarded_as_chunks() {
+    let mut parser = SseParser::new();
+    let results = feed_frame(
+        &mut parser,
+        r#"{"choices":[{"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"c","type":"function","function":{"name":"f","arguments":"{}"}}]}}]}"#,
+    );
+    assert!(results.is_empty(), "partial tool calls must not reach consumers");
+    assert_eq!(parser.tool_calls().len(), 1);
+}
+
+#[test]
+fn tool_call_round_trips_extras_through_json() {
+    let raw = json!({
+        "id": "call_1",
+        "type": "function",
+        "function": {"name": "f", "arguments": "{}"},
+        "extra_content": {"google": {"thought_signature": "sig"}}
+    });
+    let call: ToolCall = serde_json::from_value(raw.clone()).expect("decodes");
+    assert_eq!(call.id, "call_1");
+    assert_eq!(serde_json::to_value(&call).expect("encodes"), raw);
+}
+
+#[test]
+fn replayed_tool_conversation_serializes_losslessly() {
+    let call = ToolCall {
+        id: "call_1".into(),
+        kind: "function".into(),
+        function: ToolCallFunction {
+            name: "get_weather".into(),
+            arguments: r#"{"city":"Paris"}"#.into(),
+        },
+        extra: json!({"extra_content": {"google": {"thought_signature": "sig"}}})
+            .as_object()
+            .cloned()
+            .expect("object"),
+    };
+    let config = RequestConfig::new(Prompt::Messages(vec![
+        crate::Message::user("weather in Paris?"),
+        crate::Message::assistant_tool_calls("", vec![call.clone()]),
+        crate::Message::tool("call_1", r#"{"temp_c":18}"#),
+    ]));
+
+    let messages = body_json(&config)["messages"].clone();
+    assert_eq!(messages[1]["role"], json!("assistant"));
+    assert_eq!(messages[1]["content"], json!(null));
+    assert_eq!(messages[1]["tool_calls"][0]["id"], json!("call_1"));
+    assert_eq!(
+        messages[1]["tool_calls"][0]["extra_content"],
+        json!({"google": {"thought_signature": "sig"}})
+    );
+    assert_eq!(messages[2]["role"], json!("tool"));
+    assert_eq!(messages[2]["tool_call_id"], json!("call_1"));
+    assert_eq!(messages[2]["content"], json!(r#"{"temp_c":18}"#));
+}

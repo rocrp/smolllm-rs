@@ -1,12 +1,15 @@
 use std::fmt;
 use std::time::Duration;
 
+use crate::toolcall::ToolCall;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MessageRole {
     System,
     User,
     Assistant,
     Developer,
+    Tool,
 }
 
 impl MessageRole {
@@ -16,6 +19,7 @@ impl MessageRole {
             MessageRole::User => "user",
             MessageRole::Assistant => "assistant",
             MessageRole::Developer => "developer",
+            MessageRole::Tool => "tool",
         }
     }
 }
@@ -29,35 +33,77 @@ impl fmt::Display for MessageRole {
 #[derive(Debug, Clone)]
 pub struct Message {
     pub role: MessageRole,
-    pub content: String,
+    /// None on an assistant turn that only requests tool calls.
+    pub content: Option<String>,
+    /// Set on an assistant turn replaying the calls the model asked for.
+    pub tool_calls: Vec<ToolCall>,
+    /// Set on a tool result, naming the call it answers.
+    pub tool_call_id: Option<String>,
+    pub name: Option<String>,
 }
 
 impl Message {
     pub fn system(content: impl Into<String>) -> Self {
         Self {
             role: MessageRole::System,
-            content: content.into(),
+            content: Some(content.into()),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            name: None,
         }
     }
 
     pub fn user(content: impl Into<String>) -> Self {
         Self {
             role: MessageRole::User,
-            content: content.into(),
+            content: Some(content.into()),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            name: None,
         }
     }
 
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
             role: MessageRole::Assistant,
-            content: content.into(),
+            content: Some(content.into()),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            name: None,
         }
     }
 
     pub fn developer(content: impl Into<String>) -> Self {
         Self {
             role: MessageRole::Developer,
-            content: content.into(),
+            content: Some(content.into()),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    /// An assistant turn replaying the tool calls the model asked for. Pass
+    /// empty text when the turn carried no content.
+    pub fn assistant_tool_calls(text: impl Into<String>, calls: Vec<ToolCall>) -> Self {
+        let text = text.into();
+        Self {
+            role: MessageRole::Assistant,
+            content: (!text.is_empty()).then_some(text),
+            tool_calls: calls,
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    /// A tool result answering one call.
+    pub fn tool(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: MessageRole::Tool,
+            content: Some(content.into()),
+            tool_calls: Vec::new(),
+            tool_call_id: Some(tool_call_id.into()),
+            name: None,
         }
     }
 }
@@ -110,6 +156,9 @@ pub struct LLMResponse {
     pub reasoning: String,
     /// Verbatim provider string explaining why generation ended; never normalized.
     pub finish_reason: Option<String>,
+    /// Empty unless the model answered with tool calls. Executing them and
+    /// replaying the result is the caller's job — the library runs no loop.
+    pub tool_calls: Vec<ToolCall>,
     pub model: String,
     pub model_name: String,
     pub provider: String,

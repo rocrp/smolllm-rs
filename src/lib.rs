@@ -8,6 +8,7 @@ mod provider;
 mod request;
 mod selector;
 mod think;
+mod toolcall;
 mod types;
 mod utils;
 
@@ -17,6 +18,7 @@ pub use endpoint::{resolve_endpoints, ResolvedEndpoint};
 pub use error::Error;
 pub use selector::ModelInput;
 pub use think::extract_think_tags;
+pub use toolcall::{ToolCall, ToolCallFunction};
 pub use types::*;
 
 pub fn ask(prompt: impl Into<Prompt>) -> AskBuilder {

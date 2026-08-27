@@ -16,6 +16,7 @@ use crate::image::image_to_data_url;
 use crate::provider::{resolve_api_key, ParsedModel};
 use crate::request::RequestConfig;
 use crate::think::ThinkTagFilter;
+use crate::toolcall::ToolCall;
 use crate::types::*;
 use crate::utils::*;
 
@@ -222,6 +223,7 @@ async fn ask_finalize(
         reasoning,
         ttft,
         finish_reason,
+        tool_calls,
     } = outcome;
 
     let content = if config.remove_backticks {
@@ -230,7 +232,9 @@ async fn ask_finalize(
         content
     };
 
-    if content.trim().is_empty() && reasoning.trim().is_empty() {
+    // An assistant turn that only requests tool calls carries no text, but it is
+    // a complete, useful response.
+    if content.trim().is_empty() && reasoning.trim().is_empty() && tool_calls.is_empty() {
         return Err(Error::EmptyResponse {
             model: dispatch.model_str,
         });
@@ -254,6 +258,7 @@ async fn ask_finalize(
         text: content,
         reasoning,
         finish_reason,
+        tool_calls,
         model: dispatch.model_str.clone(),
         model_name: dispatch.parsed.model_name.clone(),
         provider: dispatch.parsed.provider_name.clone(),
@@ -340,10 +345,23 @@ fn build_request_body(
                 ));
             }
             for msg in msgs {
-                messages.push(serde_json::json!({
+                let mut value = serde_json::json!({
                     "role": msg.role.as_str(),
                     "content": msg.content,
-                }));
+                });
+                let object = value
+                    .as_object_mut()
+                    .expect("json! object literal is always an object");
+                if !msg.tool_calls.is_empty() {
+                    object.insert("tool_calls".into(), serde_json::to_value(&msg.tool_calls)?);
+                }
+                if let Some(ref id) = msg.tool_call_id {
+                    object.insert("tool_call_id".into(), serde_json::Value::String(id.clone()));
+                }
+                if let Some(ref name) = msg.name {
+                    object.insert("name".into(), serde_json::Value::String(name.clone()));
+                }
+                messages.push(value);
             }
         }
     }
@@ -410,6 +428,8 @@ struct SseChoice {
 
 #[derive(Default, Deserialize)]
 struct SseDelta {
+    #[serde(default)]
+    tool_calls: Vec<crate::toolcall::ToolCallDelta>,
     // Option, not String: a tool-call delta carries an explicit `content: null`,
     // which `#[serde(default)]` alone does not accept.
     #[serde(default)]
@@ -422,6 +442,7 @@ struct SseParser {
     buffer: Vec<u8>,
     think_filter: ThinkTagFilter,
     finish_reason: Option<String>,
+    tools: crate::toolcall::ToolCallAccumulator,
 }
 
 impl SseParser {
@@ -430,7 +451,13 @@ impl SseParser {
             buffer: Vec::new(),
             think_filter: ThinkTagFilter::new(),
             finish_reason: None,
+            tools: crate::toolcall::ToolCallAccumulator::default(),
         }
+    }
+
+    /// The assembled tool calls; complete only once the stream has ended.
+    fn tool_calls(&self) -> Vec<ToolCall> {
+        self.tools.result()
     }
 
     /// The provider's finish reason, verbatim; None until a frame carries one.
@@ -502,7 +529,13 @@ impl SseParser {
         if let Some(reason) = choice.finish_reason {
             self.finish_reason = Some(reason);
         }
-        let delta = choice.delta;
+        let mut delta = choice.delta;
+
+        // Tool-call fragments feed the accumulator; they are never forwarded as
+        // chunks, so a caller only ever sees complete calls after the stream ends.
+        if !delta.tool_calls.is_empty() {
+            self.tools.feed(std::mem::take(&mut delta.tool_calls));
+        }
 
         let content = delta.content.unwrap_or_default();
         let reasoning = delta.reasoning_content.unwrap_or_default();
@@ -522,6 +555,7 @@ pub(crate) struct SseOutcome {
     pub reasoning: String,
     pub ttft: Option<Duration>,
     pub finish_reason: Option<String>,
+    pub tool_calls: Vec<ToolCall>,
 }
 
 async fn consume_sse_stream(
@@ -565,6 +599,7 @@ async fn consume_sse_stream(
         reasoning: reasoning.trim().to_string(),
         ttft,
         finish_reason: parser.finish_reason().map(str::to_string),
+        tool_calls: parser.tool_calls(),
     })
 }
 
@@ -578,6 +613,7 @@ async fn process_sse_task(
     let record = |parser: &SseParser| {
         if let Ok(mut tail) = tail.lock() {
             tail.finish_reason = parser.finish_reason().map(str::to_string);
+            tail.tool_calls = parser.tool_calls();
         }
     };
     tokio::pin!(byte_stream);
@@ -631,6 +667,7 @@ async fn process_sse_task(
 #[derive(Default)]
 pub(crate) struct StreamTail {
     finish_reason: Option<String>,
+    tool_calls: Vec<ToolCall>,
 }
 
 pub(crate) type SharedTail = std::sync::Arc<std::sync::Mutex<StreamTail>>;
@@ -695,6 +732,15 @@ impl StreamResponse {
         self.tail
             .lock()
             .map(|tail| tail.finish_reason.clone())
+            .unwrap_or_default()
+    }
+
+    /// Tool calls the model requested, assembled from streamed deltas. Empty
+    /// until the stream is exhausted: partial argument JSON is never exposed.
+    pub fn tool_calls(&self) -> Vec<ToolCall> {
+        self.tail
+            .lock()
+            .map(|tail| tail.tool_calls.clone())
             .unwrap_or_default()
     }
 
