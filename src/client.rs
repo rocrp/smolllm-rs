@@ -111,7 +111,7 @@ pub(crate) struct Dispatch {
     pub parsed: ParsedModel,
     pub request_url: String,
     pub chosen_key: String,
-    pub body: ChatCompletionRequest,
+    pub body: serde_json::Value,
     pub input_tokens: usize,
 }
 
@@ -216,8 +216,13 @@ async fn ask_finalize(
     config: &RequestConfig,
 ) -> Result<LLMResponse, Error> {
     let byte_stream = response.bytes_stream();
-    let (content, reasoning, ttft) =
-        consume_sse_stream(byte_stream, config.handler.as_deref(), started).await?;
+    let outcome = consume_sse_stream(byte_stream, config.handler.as_deref(), started).await?;
+    let SseOutcome {
+        content,
+        reasoning,
+        ttft,
+        finish_reason,
+    } = outcome;
 
     let content = if config.remove_backticks {
         strip_backticks(&content)
@@ -248,6 +253,7 @@ async fn ask_finalize(
     Ok(LLMResponse {
         text: content,
         reasoning,
+        finish_reason,
         model: dispatch.model_str.clone(),
         model_name: dispatch.parsed.model_name.clone(),
         provider: dispatch.parsed.provider_name.clone(),
@@ -271,9 +277,11 @@ async fn stream_finalize(
 ) -> Result<StreamResponse, Error> {
     let byte_stream = response.bytes_stream();
     let (tx, rx) = mpsc::channel::<Result<StreamChunk, Error>>(SSE_CHANNEL_CAPACITY);
+    let tail: SharedTail = std::sync::Arc::new(std::sync::Mutex::new(StreamTail::default()));
 
+    let task_tail = std::sync::Arc::clone(&tail);
     tokio::spawn(async move {
-        process_sse_task(byte_stream, tx).await;
+        process_sse_task(byte_stream, tx, task_tail).await;
     });
 
     Ok(StreamResponse::new(
@@ -282,6 +290,7 @@ async fn stream_finalize(
         dispatch.parsed.model_name,
         dispatch.parsed.provider_name,
         dispatch.input_tokens,
+        tail,
     ))
 }
 
@@ -290,7 +299,7 @@ async fn stream_finalize(
 fn build_request_body(
     model_name: &str,
     config: &RequestConfig,
-) -> Result<ChatCompletionRequest, Error> {
+) -> Result<serde_json::Value, Error> {
     let mut messages = Vec::new();
 
     if let Some(ref sys) = config.system_prompt {
@@ -339,14 +348,27 @@ fn build_request_body(
         }
     }
 
-    Ok(ChatCompletionRequest {
+    let request = ChatCompletionRequest {
         model: model_name.to_string(),
         messages,
         stream: true,
         temperature: config.temperature,
         top_p: config.top_p,
         reasoning_effort: config.reasoning_effort.clone(),
-    })
+    };
+    let mut body = serde_json::to_value(request)?;
+
+    // Merged last: the caller wins over library defaults. Reserved keys were
+    // already rejected by the builder setter.
+    if let (Some(target), Some(extra)) = (
+        body.as_object_mut(),
+        config.extra_body.as_ref().and_then(|v| v.as_object()),
+    ) {
+        for (key, value) in extra {
+            target.insert(key.clone(), value.clone());
+        }
+    }
+    Ok(body)
 }
 
 #[derive(Serialize)]
@@ -382,19 +404,24 @@ struct SseError {
 struct SseChoice {
     #[serde(default)]
     delta: SseDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
 struct SseDelta {
+    // Option, not String: a tool-call delta carries an explicit `content: null`,
+    // which `#[serde(default)]` alone does not accept.
     #[serde(default)]
-    content: String,
+    content: Option<String>,
     #[serde(default, alias = "reasoning")]
-    reasoning_content: String,
+    reasoning_content: Option<String>,
 }
 
 struct SseParser {
     buffer: Vec<u8>,
     think_filter: ThinkTagFilter,
+    finish_reason: Option<String>,
 }
 
 impl SseParser {
@@ -402,7 +429,13 @@ impl SseParser {
         Self {
             buffer: Vec::new(),
             think_filter: ThinkTagFilter::new(),
+            finish_reason: None,
         }
+    }
+
+    /// The provider's finish reason, verbatim; None until a frame carries one.
+    fn finish_reason(&self) -> Option<&str> {
+        self.finish_reason.as_deref()
     }
 
     fn feed(&mut self, bytes: &[u8]) -> Vec<Result<StreamChunk, Error>> {
@@ -462,29 +495,40 @@ impl SseParser {
             });
         }
 
-        let delta = match frame.choices.into_iter().next() {
-            Some(choice) => choice.delta,
+        let choice = match frame.choices.into_iter().next() {
+            Some(choice) => choice,
             None => return Ok(None),
         };
+        if let Some(reason) = choice.finish_reason {
+            self.finish_reason = Some(reason);
+        }
+        let delta = choice.delta;
 
-        if delta.content.is_empty() && delta.reasoning_content.is_empty() {
+        let content = delta.content.unwrap_or_default();
+        let reasoning = delta.reasoning_content.unwrap_or_default();
+        if content.is_empty() && reasoning.is_empty() {
             return Ok(None);
         }
 
-        let raw = StreamChunk {
-            content: delta.content,
-            reasoning: delta.reasoning_content,
-        };
+        let raw = StreamChunk { content, reasoning };
         let filtered = self.think_filter.feed(raw);
         Ok((!filtered.is_empty()).then_some(filtered))
     }
+}
+
+/// Everything a consumed (non-streaming) response yielded.
+pub(crate) struct SseOutcome {
+    pub content: String,
+    pub reasoning: String,
+    pub ttft: Option<Duration>,
+    pub finish_reason: Option<String>,
 }
 
 async fn consume_sse_stream(
     byte_stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Unpin + Send,
     handler: Option<&(dyn Fn(&StreamChunk) + Send + Sync)>,
     start: Instant,
-) -> Result<(String, String, Option<Duration>), Error> {
+) -> Result<SseOutcome, Error> {
     let mut parser = SseParser::new();
     let mut content = String::new();
     let mut reasoning = String::new();
@@ -516,24 +560,32 @@ async fn consume_sse_stream(
     }
 
     let ttft = first_token_time.map(|t| t.duration_since(start));
-    Ok((
-        content.trim().to_string(),
-        reasoning.trim().to_string(),
+    Ok(SseOutcome {
+        content: content.trim().to_string(),
+        reasoning: reasoning.trim().to_string(),
         ttft,
-    ))
+        finish_reason: parser.finish_reason().map(str::to_string),
+    })
 }
 
 async fn process_sse_task(
     byte_stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Unpin + Send,
     tx: mpsc::Sender<Result<StreamChunk, Error>>,
+    tail: SharedTail,
 ) {
     let mut parser = SseParser::new();
+    // Record what the stream yielded besides chunks, however it ends.
+    let record = |parser: &SseParser| {
+        if let Ok(mut tail) = tail.lock() {
+            tail.finish_reason = parser.finish_reason().map(str::to_string);
+        }
+    };
     tokio::pin!(byte_stream);
 
     loop {
         let result = tokio::select! {
             biased;
-            _ = tx.closed() => return,
+            _ = tx.closed() => { record(&parser); return },
             result = byte_stream.next() => result,
         };
         let Some(result) = result else {
@@ -546,11 +598,13 @@ async fn process_sse_task(
                     match chunk_result {
                         Ok(chunk) => {
                             if tx.send(Ok(chunk)).await.is_err() {
+                                record(&parser);
                                 return;
                             }
                         }
                         Err(e) => {
                             let _ = tx.send(Err(e)).await;
+                            record(&parser);
                             return;
                         }
                     }
@@ -558,6 +612,7 @@ async fn process_sse_task(
             }
             Err(e) => {
                 let _ = tx.send(Err(Error::Request(e))).await;
+                record(&parser);
                 return;
             }
         }
@@ -566,11 +621,22 @@ async fn process_sse_task(
     if let Some(chunk) = parser.flush() {
         let _ = tx.send(Ok(chunk)).await;
     }
+    record(&parser);
 }
 
 // --- StreamResponse --------------------------------------------------------
 
+/// Everything a consumed stream yields besides the chunks themselves. Written by
+/// the SSE task once the stream ends, so accessors read empty until then.
+#[derive(Default)]
+pub(crate) struct StreamTail {
+    finish_reason: Option<String>,
+}
+
+pub(crate) type SharedTail = std::sync::Arc<std::sync::Mutex<StreamTail>>;
+
 pub struct StreamResponse {
+    tail: SharedTail,
     rx: tokio_stream::wrappers::ReceiverStream<Result<StreamChunk, Error>>,
     model: String,
     model_name: String,
@@ -590,8 +656,10 @@ impl StreamResponse {
         model_name: String,
         provider: String,
         input_tokens: usize,
+        tail: SharedTail,
     ) -> Self {
         Self {
+            tail,
             rx: tokio_stream::wrappers::ReceiverStream::new(rx),
             model,
             model_name,
@@ -619,6 +687,15 @@ impl StreamResponse {
 
     pub fn reasoning(&self) -> &str {
         &self.reasoning
+    }
+
+    /// The provider's finish reason, verbatim and never normalized. Populated
+    /// once the stream is exhausted, like `reasoning` and `usage`.
+    pub fn finish_reason(&self) -> Option<String> {
+        self.tail
+            .lock()
+            .map(|tail| tail.finish_reason.clone())
+            .unwrap_or_default()
     }
 
     pub fn usage(&self) -> Usage {

@@ -108,6 +108,8 @@ impl fmt::Display for StreamChunk {
 pub struct LLMResponse {
     pub text: String,
     pub reasoning: String,
+    /// Verbatim provider string explaining why generation ended; never normalized.
+    pub finish_reason: Option<String>,
     pub model: String,
     pub model_name: String,
     pub provider: String,

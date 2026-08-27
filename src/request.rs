@@ -20,6 +20,9 @@ pub(crate) struct RequestConfig {
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
     pub reasoning_effort: Option<String>,
+    /// Raw request fields the library does not model, merged into the payload
+    /// last so the caller wins. Validated by the builder setter.
+    pub extra_body: Option<serde_json::Value>,
     pub handler: Option<Box<ChunkHandler>>,
     pub hook: Option<Box<EventHook>>,
     pub http_client: Option<reqwest::Client>,
@@ -39,6 +42,7 @@ impl RequestConfig {
             temperature: None,
             top_p: None,
             reasoning_effort: None,
+            extra_body: None,
             handler: None,
             hook: None,
             http_client: None,

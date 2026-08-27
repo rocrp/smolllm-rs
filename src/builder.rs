@@ -16,6 +16,10 @@ pub struct StreamBuilder {
     config: RequestConfig,
 }
 
+/// Fields the library machinery reads back: the stream parser, usage collection
+/// and routing all depend on them, so a caller override would silently break them.
+const RESERVED_EXTRA_BODY_KEYS: [&str; 4] = ["stream", "stream_options", "messages", "model"];
+
 macro_rules! shared_setters {
     ($t:ty) => {
         impl $t {
@@ -98,6 +102,31 @@ macro_rules! shared_setters {
                     ));
                 }
                 self.config.reasoning_effort = Some(s);
+                Ok(self)
+            }
+
+            /// Set raw request fields the library does not model (`tools`,
+            /// `response_format`, `max_tokens`, provider-private params). Merged
+            /// into the payload last, so these win over library defaults.
+            ///
+            /// Rejected here rather than at send time: every error inside the
+            /// fallback loop is retried on each leg and reported from the last.
+            pub fn extra_body(mut self, fields: serde_json::Value) -> Result<Self, Error> {
+                let object = fields.as_object().ok_or_else(|| {
+                    Error::InvalidParam("extra_body must be a JSON object".into())
+                })?;
+                let reserved: Vec<&str> = RESERVED_EXTRA_BODY_KEYS
+                    .iter()
+                    .copied()
+                    .filter(|key| object.contains_key(*key))
+                    .collect();
+                if !reserved.is_empty() {
+                    return Err(Error::InvalidParam(format!(
+                        "extra_body may not set {}",
+                        reserved.join(", ")
+                    )));
+                }
+                self.config.extra_body = Some(fields);
                 Ok(self)
             }
 
