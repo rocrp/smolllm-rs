@@ -321,7 +321,9 @@ async fn ask_finalize(
     }
 
     // A capped answer is a failed leg: the next model may have room to finish.
-    if is_truncated(finish_reason.as_deref(), !content.trim().is_empty()) {
+    let produced_output =
+        !content.trim().is_empty() || !reasoning.trim().is_empty() || !tool_calls.is_empty();
+    if is_truncated(finish_reason.as_deref(), produced_output) {
         return Err(Error::Truncated {
             model: dispatch.model_str,
         });
@@ -388,7 +390,7 @@ async fn stream_finalize(
     // the connection, or stream nothing at all. Waiting here for the first chunk
     // keeps all of that inside the fallback chain — past this point output has
     // been delivered and switching models would splice two answers together.
-    let first = take_first_chunk(&mut rx, &dispatch.model_str).await?;
+    let first = take_first_chunk(&mut rx, &tail, &dispatch.model_str).await?;
 
     Ok(StreamResponse::new(StreamInit {
         rx,
@@ -399,23 +401,38 @@ async fn stream_finalize(
         api_key_hint: preview_api_key(&dispatch.chosen_key),
         input_tokens: dispatch.input_tokens,
         start: started,
-        first: Some(first),
+        first,
         hook: config.hook.clone(),
     }))
 }
 
 /// Awaits the first item of a stream: a chunk, the failure that came instead, or
 /// `EmptyResponse` for a stream that ended without producing anything.
+///
+/// A turn that only requests tool calls yields no chunks at all — the deltas
+/// feed the accumulator and are never forwarded — but it is a complete, useful
+/// response, the same rule `ask` applies. The channel closes only after the SSE
+/// task has recorded the tail, so the tool calls are already there to see.
 async fn take_first_chunk(
     rx: &mut mpsc::Receiver<Result<StreamChunk, Error>>,
+    tail: &SharedTail,
     model: &str,
-) -> Result<StreamChunk, Error> {
+) -> Result<Option<StreamChunk>, Error> {
     match rx.recv().await {
-        Some(Ok(chunk)) => Ok(chunk),
+        Some(Ok(chunk)) => Ok(Some(chunk)),
         Some(Err(error)) => Err(error),
-        None => Err(Error::EmptyResponse {
-            model: model.to_string(),
-        }),
+        None => {
+            let answered_with_tools = tail
+                .lock()
+                .map(|tail| !tail.tool_calls.is_empty())
+                .unwrap_or(false);
+            if answered_with_tools {
+                return Ok(None);
+            }
+            Err(Error::EmptyResponse {
+                model: model.to_string(),
+            })
+        }
     }
 }
 
@@ -879,16 +896,19 @@ async fn process_sse_task(
                             }
                         }
                         Err(e) => {
-                            let _ = tx.send(Err(e)).await;
+                            // Recorded first: the consumer reads the tail the
+                            // moment it sees this error, and a tail written
+                            // afterwards would hand its hook estimated usage.
                             record(&parser);
+                            let _ = tx.send(Err(e)).await;
                             return;
                         }
                     }
                 }
             }
             Err(e) => {
-                let _ = tx.send(Err(Error::Request(e))).await;
                 record(&parser);
+                let _ = tx.send(Err(Error::Request(e))).await;
                 return;
             }
         }
@@ -1014,7 +1034,9 @@ impl StreamResponse {
     /// Whether the answer was cut short: the provider hit its output cap, or the
     /// stream ended without its terminal frame. Final once exhausted.
     pub fn truncated(&self) -> bool {
-        is_truncated(self.finish_reason().as_deref(), !self.delivered.is_empty())
+        let produced_output =
+            !self.delivered.is_empty() || !self.reasoning.is_empty() || !self.tool_calls().is_empty();
+        is_truncated(self.finish_reason().as_deref(), produced_output)
     }
 
     /// Tool calls the model requested, assembled from streamed deltas. Empty

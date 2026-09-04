@@ -99,6 +99,12 @@ impl ModelInput {
                 reason: "list contains empty entry".into(),
             });
         }
+        // A malformed `!effort` suffix is rejected here, before the fallback
+        // loop: raised per leg it would look like a failed model and silently
+        // fall through to the next one, which is the opposite of failing fast.
+        for model in models {
+            crate::provider::split_effort_suffix(model)?;
+        }
         Ok(())
     }
 

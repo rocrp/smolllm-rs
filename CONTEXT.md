@@ -9,7 +9,7 @@ A named OpenAI-compatible endpoint (e.g. `openai`, `groq`); credentials and base
 _Avoid_: vendor, backend.
 
 **Model spec**:
-The user-facing model string `provider/model`, or bare `model` (no `/`) — bare form has no provider and resolves base URL/API key from explicit builder options only, never env. Comma-separated specs form a fallback chain; may mix both forms. Explicit base URL applies to every leg. A leg may carry a `!effort` suffix (`proxy/gpt-5!high`) that overrides the call-level reasoning effort for that leg alone and never reaches the wire; a suffix with nothing after the `!` is rejected as a typo rather than ignored.
+The user-facing model string `provider/model`, or bare `model` (no `/`) — bare form has no provider and resolves base URL/API key from explicit builder options only, never env. Comma-separated specs form a fallback chain; may mix both forms. Explicit base URL applies to every leg. A leg may carry a `!effort` suffix (`proxy/gpt-5!high`) that overrides the call-level reasoning effort for that leg alone, is lowercased, and never reaches the wire; a suffix with nothing after the `!` is rejected up front as a typo rather than ignored, so it cannot be mistaken for a failed leg and fall through to the next model.
 
 **Fallback chain**:
 Ordered or weighted candidate models; on failure the call advances to the next candidate. A leg counts as failed until it delivers its first chunk — an HTTP error, an error frame after a 200, a dropped connection, or a stream that ends empty all advance the chain. Once content has reached the consumer the chain is committed: a later failure surfaces as a stream error carrying the Partial output, because splicing a second model onto half an answer is worse than failing.
@@ -28,7 +28,7 @@ One (API key, base URL) combination for a provider; the least-used pair is chose
 Token counts the provider itself sent, requested with `stream_options.include_usage` and merged field by field across the frames that carry them. An endpoint that rejects the field with a 400 is retried once without it.
 
 **Estimated usage**:
-Token counts derived by heuristic (chars/4), used for whichever side the provider did not report. `Usage.estimated` is true when any count came from the heuristic, and the metrics log marks those totals with `~`.
+Token counts derived by heuristic (characters/4, matching the Python port so the two are comparable), used for whichever side the provider did not report. `Usage.estimated` is true when any count came from the heuristic, and the metrics log marks those totals with `~`.
 
 **Reasoning**:
 Model thinking text, kept in a channel separate from content.

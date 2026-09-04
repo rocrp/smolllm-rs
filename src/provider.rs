@@ -79,7 +79,7 @@ pub struct ParsedModel {
 
 /// Splits a `!effort` suffix off a model spec. The suffix belongs to this leg
 /// alone, so a chain can mix efforts: `proxy/qwen3!none,proxy/gpt-5!high`.
-fn split_effort_suffix(spec: &str) -> Result<(&str, Option<String>), Error> {
+pub(crate) fn split_effort_suffix(spec: &str) -> Result<(&str, Option<String>), Error> {
     let Some((model, effort)) = spec.split_once('!') else {
         return Ok((spec, None));
     };
@@ -89,7 +89,9 @@ fn split_effort_suffix(spec: &str) -> Result<(&str, Option<String>), Error> {
             "missing reasoning effort after '!' in '{spec}'"
         )));
     }
-    Ok((model.trim(), Some(effort.to_string())))
+    // Lowercased to match the Python port, so one config string behaves the
+    // same on a provider that only accepts the lowercase spelling.
+    Ok((model.trim(), Some(effort.to_ascii_lowercase())))
 }
 
 pub fn parse_model_string(model: &str) -> Result<ParsedModel, Error> {

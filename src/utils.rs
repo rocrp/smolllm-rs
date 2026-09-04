@@ -29,12 +29,10 @@ pub fn parse_base_url_list(items: &str) -> Result<Vec<String>, Error> {
     split_comma_list(items).map_err(|reason| Error::InvalidBaseUrlList { reason })
 }
 
+/// Characters, not bytes: the Python port counts characters, and a count that
+/// tripled for a CJK prompt would make the two ports' `~` figures incomparable.
 pub fn estimate_tokens(text: &str) -> usize {
-    if text.is_empty() {
-        0
-    } else {
-        text.len() / 4
-    }
+    text.chars().count() / 4
 }
 
 pub fn strip_backticks(text: &str) -> String {
@@ -53,12 +51,17 @@ pub fn strip_backticks(text: &str) -> String {
     body.trim_end_matches('\n').to_string()
 }
 
+/// A key reduced to something safe to log. Counted in characters: byte slicing
+/// panics on a key that picked up a non-ASCII character from a paste, and this
+/// runs on every dispatch.
 pub fn preview_api_key(key: &str) -> String {
-    if key.len() <= 9 {
-        key.to_string()
-    } else {
-        format!("{}...{}", &key[..5], &key[key.len() - 4..])
+    let characters: Vec<char> = key.chars().collect();
+    if characters.len() <= 9 {
+        return key.to_string();
     }
+    let head: String = characters[..5].iter().collect();
+    let tail: String = characters[characters.len() - 4..].iter().collect();
+    format!("{head}...{tail}")
 }
 
 pub fn format_metrics(
@@ -119,8 +122,12 @@ fn is_delimiter(c: char) -> bool {
 }
 
 /// Names that introduce a credential when followed by `:` or `=`.
+///
+/// A prefixed header names the same thing as the bare form, so `x-api-key` and
+/// `X_API_KEY` count as `api-key`. This mirrors the word boundary in the Python
+/// port's pattern, which matches inside a hyphenated header too.
 fn is_credential_name(word: &str) -> bool {
-    [
+    const NAMES: [&str; 9] = [
         "api_key",
         "api-key",
         "apikey",
@@ -129,9 +136,13 @@ fn is_credential_name(word: &str) -> bool {
         "accesstoken",
         "token",
         "key",
-    ]
-    .iter()
-    .any(|name| word.eq_ignore_ascii_case(name))
+        "authorization",
+    ];
+    let bytes = word.as_bytes();
+    // Only `-`/`_` separated suffixes, so the split is always a char boundary.
+    (0..word.len())
+        .filter(|&at| at == 0 || matches!(bytes[at - 1], b'-' | b'_'))
+        .any(|at| NAMES.iter().any(|name| word[at..].eq_ignore_ascii_case(name)))
 }
 
 /// Shapes that are a secret wherever they appear, with no name to introduce them.
@@ -139,9 +150,14 @@ fn looks_like_secret(word: &str) -> bool {
     if word.starts_with("AIza") && word.len() >= 16 {
         return true;
     }
-    ["sk-", "ghp_", "gho_", "ghu_", "ghs_", "ghr_"]
-        .iter()
-        .any(|prefix| word.starts_with(prefix) && word.len() >= prefix.len() + 10)
+    // `gsk_` (Groq) and `xai-` are not in the Python port's list; a key that
+    // leaks here leaks into a log and an error the caller renders, so this side
+    // errs towards catching more.
+    [
+        "sk-", "gsk_", "xai-", "ghp_", "gho_", "ghu_", "ghs_", "ghr_",
+    ]
+    .iter()
+    .any(|prefix| word.starts_with(prefix) && word.len() >= prefix.len() + 10)
 }
 
 /// Replaces credentials a provider echoed back with a marker. Handles the three
@@ -170,8 +186,16 @@ pub fn redact_credentials(text: &str) -> String {
 
         let next_word_at = after.find(|c: char| !is_delimiter(c)).unwrap_or(after.len());
         let separator = &after[..next_word_at];
+        // `Bearer` after a name introduces the token, not itself: let the
+        // Bearer rule redact what follows rather than the scheme word.
+        let next_is_bearer = after[next_word_at..]
+            .split(is_delimiter)
+            .next()
+            .is_some_and(|next| next.eq_ignore_ascii_case("bearer"));
         redact_this_word = word.eq_ignore_ascii_case("bearer")
-            || (is_credential_name(word) && separator.contains([':', '=']));
+            || (is_credential_name(word)
+                && separator.contains([':', '='])
+                && !next_is_bearer);
         rest = after;
     }
     out
@@ -224,6 +248,32 @@ mod tests {
 
         assert!(!redact_credentials("api_key=AIzaSyA1234567890abcdef").contains("AIzaSyA"));
         assert!(!redact_credentials("used sk-0123456789abcdef here").contains("sk-01234"));
+    }
+
+    #[test]
+    fn redaction_catches_the_shapes_providers_actually_echo_back() {
+        for leaky in [
+            r#"{"headers":{"x-api-key":"a1b2c3d4e5f6g7h8"}}"#,
+            r#"{"authorization":"a1b2c3d4e5f6g7h8i9"}"#,
+            r#"{"error":"invalid key gsk_ABCDEFGHIJKLMNOP for account"}"#,
+            r#"{"X_API_KEY":"plain-secret-value"}"#,
+        ] {
+            let redacted = redact_credentials(leaky);
+            assert!(redacted.contains(REDACTED), "missed a credential in {leaky}");
+        }
+    }
+
+    #[test]
+    fn an_authorization_header_redacts_the_token_not_the_scheme() {
+        let redacted = redact_credentials(r#"{"Authorization":"Bearer sk-live-abcdef123456"}"#);
+        assert!(redacted.contains("Bearer"), "the scheme is not the secret: {redacted}");
+        assert!(!redacted.contains("sk-live-abcdef123456"), "{redacted}");
+    }
+
+    #[test]
+    fn a_key_that_survived_is_never_a_prefix_of_the_output() {
+        let redacted = redact_credentials("Authorization: Bearer sk-0123456789abcdef");
+        assert!(!redacted.contains("sk-0123456789abcdef"), "{redacted}");
     }
 
     #[test]

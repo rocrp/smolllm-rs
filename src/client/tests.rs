@@ -587,9 +587,9 @@ fn recording_hook() -> (Arc<EventHook>, Arc<Mutex<Vec<RequestEvent>>>) {
 
 #[tokio::test]
 async fn a_failure_before_any_chunk_is_reported_so_the_chain_can_advance() {
-    let (mut rx, _tail) = spawn_sse(b"data: {\"error\":{\"message\":\"upstream exploded\"}}\n");
+    let (mut rx, tail) = spawn_sse(b"data: {\"error\":{\"message\":\"upstream exploded\"}}\n");
 
-    let err = super::take_first_chunk(&mut rx, "x/a")
+    let err = super::take_first_chunk(&mut rx, &tail, "x/a")
         .await
         .expect_err("an error frame before any content fails the leg");
     assert!(err.to_string().contains("upstream exploded"), "{err}");
@@ -597,9 +597,9 @@ async fn a_failure_before_any_chunk_is_reported_so_the_chain_can_advance() {
 
 #[tokio::test]
 async fn a_stream_that_ends_without_chunks_is_an_empty_response() {
-    let (mut rx, _tail) = spawn_sse(b"data: [DONE]\n");
+    let (mut rx, tail) = spawn_sse(b"data: [DONE]\n");
 
-    let err = super::take_first_chunk(&mut rx, "x/a")
+    let err = super::take_first_chunk(&mut rx, &tail, "x/a")
         .await
         .expect_err("a 200 that streams nothing is a failed leg, not a success");
     assert!(
@@ -617,11 +617,11 @@ async fn the_first_chunk_is_replayed_before_the_rest_of_the_stream() {
         )
         .as_bytes(),
     );
-    let first = super::take_first_chunk(&mut rx, "x/a")
+    let first = super::take_first_chunk(&mut rx, &tail, "x/a")
         .await
         .expect("first chunk");
     let mut response = StreamResponse::new(StreamInit {
-        first: Some(first),
+        first,
         ..test_init(rx, tail)
     });
 
@@ -898,5 +898,82 @@ fn a_rate_limited_leg_yields_to_the_next_model_instead_of_waiting() {
             false
         ),
         "a 400 is not transient"
+    );
+}
+
+#[tokio::test]
+async fn a_turn_that_only_requests_tool_calls_is_not_an_empty_response() {
+    // Tool-call deltas never surface as chunks, so this stream yields nothing
+    // at all — but it is a complete answer, and failing the leg would throw the
+    // assembled call away and move on to another model.
+    let (mut rx, tail) = spawn_sse(
+        concat!(
+            r#"data: {"choices":[{"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{}"}}]}}]}"#,
+            "\n",
+            r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "\n",
+            "data: [DONE]\n",
+        )
+        .as_bytes(),
+    );
+
+    let first = super::take_first_chunk(&mut rx, &tail, "x/a")
+        .await
+        .expect("a tool-call answer is a success, not an empty response");
+    assert!(first.is_none(), "there is no first chunk to replay");
+
+    let response = StreamResponse::new(StreamInit {
+        first,
+        ..test_init(rx, tail)
+    });
+    let calls = response.tool_calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].function.name, "get_weather");
+}
+
+#[tokio::test]
+async fn truncation_counts_reasoning_and_tool_calls_as_output() {
+    let reasoning_only = collect_stream(
+        b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\"}}]}\n",
+    )
+    .await;
+    let mut reasoning_only = reasoning_only;
+    while reasoning_only.next().await.is_some() {}
+    assert!(
+        reasoning_only.truncated(),
+        "a reasoning-only stream that lost its final frame was still cut off"
+    );
+
+    let (rx, tail) = spawn_sse(
+        concat!(
+            r#"data: {"choices":[{"delta":{"content":null,"tool_calls":[{"index":0,"id":"c","type":"function","function":{"name":"f","arguments":"{}"}}]}}]}"#,
+            "\n",
+        )
+        .as_bytes(),
+    );
+    let mut tools_only = StreamResponse::new(test_init(rx, tail));
+    while tools_only.next().await.is_some() {}
+    assert!(
+        tools_only.truncated(),
+        "half-written argument JSON with no finish reason is a cut-off answer"
+    );
+}
+
+#[test]
+fn a_malformed_effort_suffix_fails_the_call_instead_of_falling_through() {
+    let err = crate::selector::ModelInput::from("x/a!,x/b")
+        .validate()
+        .expect_err("a typo must not be mistaken for a failed leg");
+    assert!(
+        matches!(&err, crate::Error::InvalidModel(msg) if msg.contains("x/a!")),
+        "{err}"
+    );
+}
+
+#[test]
+fn an_effort_suffix_is_lowercased_for_the_wire() {
+    assert_eq!(
+        body_for_spec("x/m!HIGH", &config_with("hi"))["reasoning_effort"],
+        json!("high")
     );
 }
