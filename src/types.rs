@@ -185,6 +185,8 @@ pub struct Usage {
     pub api_key_hint: String,
     pub input_tokens: usize,
     pub output_tokens: usize,
+    /// True when any count is a chars/4 heuristic rather than provider-reported.
+    pub estimated: bool,
     pub duration: Duration,
     pub ttft: Option<Duration>,
 }
@@ -198,6 +200,7 @@ impl Default for Usage {
             api_key_hint: String::new(),
             input_tokens: 0,
             output_tokens: 0,
+            estimated: true,
             duration: Duration::ZERO,
             ttft: None,
         }

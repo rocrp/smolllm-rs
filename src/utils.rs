@@ -67,6 +67,7 @@ pub fn format_metrics(
     output_tokens: usize,
     total: Duration,
     ttft: Option<Duration>,
+    estimated: bool,
 ) -> String {
     let total_tokens = input_tokens + output_tokens;
     let tok_per_sec = if total.as_secs_f64() > 0.0 && output_tokens > 0 {
@@ -75,8 +76,9 @@ pub fn format_metrics(
         0
     };
 
+    let approx = if estimated { "~" } else { "" };
     let mut s = format!(
-        "\u{1f4ca}{model_name} {total_tokens}tok (\u{2191}{input_tokens} \u{2193}{output_tokens})"
+        "\u{1f4ca}{model_name} {approx}{total_tokens}tok (\u{2191}{input_tokens} \u{2193}{output_tokens})"
     );
 
     if let Some(ttft) = ttft {

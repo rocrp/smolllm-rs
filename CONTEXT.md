@@ -21,8 +21,11 @@ Re-attempt of the *same* model after a transient failure. Distinct from fallback
 **Balancer pair**:
 One (API key, base URL) combination for a provider; the least-used pair is chosen per call.
 
+**Reported usage**:
+Token counts the provider itself sent, requested with `stream_options.include_usage` and merged field by field across the frames that carry them. An endpoint that rejects the field with a 400 is retried once without it.
+
 **Estimated usage**:
-Token counts derived by heuristic; this port never reads provider-reported usage, so every count is an estimate.
+Token counts derived by heuristic (chars/4), used for whichever side the provider did not report. `Usage.estimated` is true when any count came from the heuristic, and the metrics log marks those totals with `~`.
 
 **Reasoning**:
 Model thinking text, kept in a channel separate from content.

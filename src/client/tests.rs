@@ -8,7 +8,49 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tokio_stream::StreamExt;
 
-use super::{process_sse_task, StreamResponse};
+use super::{process_sse_task, SharedTail, StreamInit, StreamResponse, StreamTail};
+
+/// A byte stream that yields one buffer and then ends, standing in for a
+/// provider's SSE response.
+struct StaticByteStream {
+    chunks: std::vec::IntoIter<Bytes>,
+}
+
+impl Stream for StaticByteStream {
+    type Item = Result<Bytes, reqwest::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Poll::Ready(self.get_mut().chunks.next().map(Ok))
+    }
+}
+
+fn shared_tail() -> SharedTail {
+    std::sync::Arc::new(std::sync::Mutex::new(StreamTail::default()))
+}
+
+/// Init for a stream the test drives directly, standing in for a dispatch.
+fn test_init(rx: mpsc::Receiver<Result<crate::StreamChunk, crate::Error>>, tail: SharedTail) -> StreamInit {
+    StreamInit {
+        rx,
+        tail,
+        model: "custom/model".into(),
+        model_name: "model".into(),
+        provider: "custom".into(),
+        api_key_hint: crate::utils::preview_api_key("sk-1234567890abcdef"),
+        input_tokens: 0,
+    }
+}
+
+/// A `StreamResponse` fed by one fixed SSE buffer.
+async fn collect_stream(bytes: &'static [u8]) -> StreamResponse {
+    let stream = StaticByteStream {
+        chunks: vec![Bytes::from_static(bytes)].into_iter(),
+    };
+    let (tx, rx) = mpsc::channel(16);
+    let tail = shared_tail();
+    tokio::spawn(process_sse_task(stream, tx, std::sync::Arc::clone(&tail)));
+    StreamResponse::new(test_init(rx, tail))
+}
 
 struct OneThenPendingByteStream {
     next: Option<Bytes>,
@@ -33,17 +75,9 @@ async fn streaming_task_stops_when_response_is_dropped_after_content() {
         )),
     };
     let (tx, rx) = mpsc::channel(1);
-    let tail: super::SharedTail =
-        std::sync::Arc::new(std::sync::Mutex::new(super::StreamTail::default()));
+    let tail = shared_tail();
     let task = tokio::spawn(process_sse_task(stream, tx, std::sync::Arc::clone(&tail)));
-    let mut response = StreamResponse::new(
-        rx,
-        "custom/model".into(),
-        "model".into(),
-        "custom".into(),
-        0,
-        tail,
-    );
+    let mut response = StreamResponse::new(test_init(rx, tail));
 
     let chunk = timeout(Duration::from_secs(1), response.next())
         .await
@@ -366,17 +400,14 @@ async fn stream_response_reports_the_resolved_model_before_it_is_exhausted() {
         )),
     };
     let (tx, rx) = mpsc::channel(1);
-    let tail: super::SharedTail =
-        std::sync::Arc::new(std::sync::Mutex::new(super::StreamTail::default()));
+    let tail = shared_tail();
     tokio::spawn(process_sse_task(stream, tx, std::sync::Arc::clone(&tail)));
-    let mut response = StreamResponse::new(
-        rx,
-        "smolserver/summary".into(),
-        "summary".into(),
-        "smolserver".into(),
-        0,
-        tail,
-    );
+    let mut response = StreamResponse::new(StreamInit {
+        model: "smolserver/summary".into(),
+        model_name: "summary".into(),
+        provider: "smolserver".into(),
+        ..test_init(rx, tail)
+    });
 
     let chunk = timeout(Duration::from_secs(1), response.next())
         .await
@@ -392,10 +423,124 @@ async fn stream_response_reports_the_resolved_model_before_it_is_exhausted() {
 async fn actual_model_falls_back_to_the_requested_spec() {
     let (tx, rx) = mpsc::channel::<Result<crate::StreamChunk, crate::Error>>(1);
     drop(tx);
-    let tail: super::SharedTail =
-        std::sync::Arc::new(std::sync::Mutex::new(super::StreamTail::default()));
-    let response = StreamResponse::new(rx, "gemini/flash".into(), "flash".into(), "gemini".into(), 0, tail);
+    let response = StreamResponse::new(StreamInit {
+        model: "gemini/flash".into(),
+        model_name: "flash".into(),
+        provider: "gemini".into(),
+        ..test_init(rx, shared_tail())
+    });
 
     assert_eq!(response.resolved_model(), None);
     assert_eq!(response.actual_model(), "gemini/flash");
+}
+
+// --- rs#7: real usage -------------------------------------------------------
+
+#[test]
+fn requests_ask_the_endpoint_to_report_usage() {
+    // Every request this library sends streams on the wire, ask included, so
+    // both paths can be handed real counts.
+    assert_eq!(
+        body_json(&config_with("hi"))["stream_options"],
+        json!({"include_usage": true})
+    );
+}
+
+#[test]
+fn dropping_stream_options_reports_whether_it_was_there() {
+    let mut body = body_json(&config_with("hi"));
+    assert!(super::drop_stream_options(&mut body), "first drop removes it");
+    assert!(body.get("stream_options").is_none());
+    assert!(!super::drop_stream_options(&mut body), "second drop finds nothing");
+}
+
+#[test]
+fn parser_reads_the_usage_frame() {
+    let mut parser = SseParser::new();
+    feed_frame(&mut parser, r#"{"choices":[{"delta":{"content":"hi"}}]}"#);
+    feed_frame(
+        &mut parser,
+        r#"{"choices":[],"usage":{"prompt_tokens":9182,"completion_tokens":1104}}"#,
+    );
+    let reported = parser.reported_usage();
+    assert_eq!(reported.prompt_tokens, Some(9182));
+    assert_eq!(reported.completion_tokens, Some(1104));
+}
+
+#[test]
+fn parser_merges_usage_fields_reported_across_frames() {
+    let mut parser = SseParser::new();
+    feed_frame(&mut parser, r#"{"choices":[],"usage":{"prompt_tokens":10}}"#);
+    feed_frame(&mut parser, r#"{"choices":[],"usage":{"completion_tokens":20}}"#);
+    let reported = parser.reported_usage();
+    assert_eq!(reported.prompt_tokens, Some(10));
+    assert_eq!(reported.completion_tokens, Some(20));
+}
+
+#[test]
+fn parser_reports_no_usage_when_the_provider_omits_it() {
+    let mut parser = SseParser::new();
+    feed_frame(&mut parser, r#"{"choices":[{"delta":{"content":"hi"}}]}"#);
+    assert_eq!(parser.reported_usage(), super::ReportedUsage::default());
+}
+
+#[test]
+fn reported_counts_win_and_missing_ones_fall_back_to_estimates() {
+    use super::{resolve_usage_tokens, ReportedUsage};
+
+    let both = ReportedUsage {
+        prompt_tokens: Some(100),
+        completion_tokens: Some(7),
+    };
+    assert_eq!(resolve_usage_tokens(both, 4, 3), (100, 7, false));
+
+    let partial = ReportedUsage {
+        prompt_tokens: Some(100),
+        completion_tokens: None,
+    };
+    assert_eq!(
+        resolve_usage_tokens(partial, 4, 3),
+        (100, 3, true),
+        "one estimated field makes the whole usage estimated"
+    );
+
+    assert_eq!(
+        resolve_usage_tokens(ReportedUsage::default(), 4, 3),
+        (4, 3, true)
+    );
+}
+
+#[tokio::test]
+async fn stream_usage_is_exact_once_the_provider_reports_it() {
+    let bytes = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":9182,\"completion_tokens\":1104}}\n",
+    );
+    let mut response = collect_stream(bytes.as_bytes()).await;
+    while response.next().await.is_some() {}
+
+    let usage = response.usage();
+    assert_eq!(usage.input_tokens, 9182);
+    assert_eq!(usage.output_tokens, 1104);
+    assert!(!usage.estimated);
+    assert_eq!(usage.api_key_hint, "sk-12...cdef");
+}
+
+#[tokio::test]
+async fn stream_usage_is_estimated_when_the_provider_reports_none() {
+    let mut response =
+        collect_stream(b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n").await;
+    while response.next().await.is_some() {}
+
+    let usage = response.usage();
+    assert!(usage.estimated);
+    assert_eq!(usage.output_tokens, "hello".len() / 4);
+}
+
+#[test]
+fn estimated_metrics_are_marked_approximate() {
+    let exact = crate::utils::format_metrics("m", 10, 5, Duration::from_secs(1), None, false);
+    let approx = crate::utils::format_metrics("m", 10, 5, Duration::from_secs(1), None, true);
+    assert!(!exact.contains('~'), "{exact}");
+    assert!(approx.contains("~15tok"), "{approx}");
 }

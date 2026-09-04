@@ -86,7 +86,7 @@ async fn dispatch_one<R, F>(
 where
     F: for<'a> Fn(Dispatch, reqwest::Response, Instant, &'a RequestConfig) -> FinalizeFut<'a, R>,
 {
-    let dispatch = Dispatch::prepare(model_str, config)?;
+    let mut dispatch = Dispatch::prepare(model_str, config)?;
     log::info!(
         "Sending request: url={} model={} key={} approx_tokens={}",
         dispatch.request_url,
@@ -95,7 +95,7 @@ where
         dispatch.input_tokens,
     );
     let started = Instant::now();
-    let response = send_with_retry(client, &dispatch, config.timeout).await?;
+    let response = send_with_retry(client, &mut dispatch, config.timeout).await?;
     finalize(dispatch, response, started, config).await
 }
 
@@ -143,11 +143,13 @@ impl Dispatch {
 
 async fn send_with_retry(
     client: &reqwest::Client,
-    dispatch: &Dispatch,
+    dispatch: &mut Dispatch,
     timeout: Duration,
 ) -> Result<reqwest::Response, Error> {
     let mut last_err: Option<Error> = None;
-    for attempt in 0..MAX_RETRIES {
+    let mut may_drop_stream_options = true;
+    let mut attempt = 0usize;
+    while attempt < MAX_RETRIES {
         if attempt > 0 {
             let delay = retry_delay(attempt);
             log::warn!(
@@ -175,6 +177,7 @@ async fn send_with_retry(
                 let err = Error::Request(e);
                 if err.is_retryable() && attempt < MAX_RETRIES - 1 {
                     last_err = Some(err);
+                    attempt += 1;
                     continue;
                 }
                 return Err(err);
@@ -184,12 +187,24 @@ async fn send_with_retry(
         let status = resp.status().as_u16();
         if status >= 400 {
             let body_text = resp.text().await.unwrap_or_default();
+            // Some OpenAI-compatible endpoints reject `stream_options` outright.
+            // Retry the same leg once without it — no backoff, no retry budget,
+            // since nothing here is transient.
+            if status == 400 && may_drop_stream_options && drop_stream_options(&mut dispatch.body) {
+                may_drop_stream_options = false;
+                log::warn!(
+                    "Endpoint rejected stream_options (400), retrying without it: model={}",
+                    dispatch.model_str,
+                );
+                continue;
+            }
             let err = Error::Http {
                 status,
                 body: body_text,
             };
             if err.is_retryable() && attempt < MAX_RETRIES - 1 {
                 last_err = Some(err);
+                attempt += 1;
                 continue;
             }
             return Err(err);
@@ -224,6 +239,7 @@ async fn ask_finalize(
         ttft,
         finish_reason,
         resolved_model,
+        reported_usage,
         tool_calls,
     } = outcome;
 
@@ -242,16 +258,21 @@ async fn ask_finalize(
     }
 
     let total = started.elapsed();
-    let output_tokens = estimate_tokens(&format!("{content}{reasoning}"));
+    let (input_tokens, output_tokens, estimated) = resolve_usage_tokens(
+        reported_usage,
+        dispatch.input_tokens,
+        estimate_tokens(&format!("{content}{reasoning}")),
+    );
 
     log::info!(
         "{}",
         format_metrics(
             &dispatch.parsed.model_name,
-            dispatch.input_tokens,
+            input_tokens,
             output_tokens,
             total,
-            ttft
+            ttft,
+            estimated,
         )
     );
 
@@ -269,8 +290,9 @@ async fn ask_finalize(
             model: dispatch.model_str,
             model_name: dispatch.parsed.model_name,
             api_key_hint: preview_api_key(&dispatch.chosen_key),
-            input_tokens: dispatch.input_tokens,
+            input_tokens,
             output_tokens,
+            estimated,
             duration: total,
             ttft,
         },
@@ -291,14 +313,15 @@ async fn stream_finalize(
         process_sse_task(byte_stream, tx, task_tail).await;
     });
 
-    Ok(StreamResponse::new(
+    Ok(StreamResponse::new(StreamInit {
         rx,
-        dispatch.model_str,
-        dispatch.parsed.model_name,
-        dispatch.parsed.provider_name,
-        dispatch.input_tokens,
         tail,
-    ))
+        model: dispatch.model_str,
+        model_name: dispatch.parsed.model_name,
+        provider: dispatch.parsed.provider_name,
+        api_key_hint: preview_api_key(&dispatch.chosen_key),
+        input_tokens: dispatch.input_tokens,
+    }))
 }
 
 // --- Request body construction ---------------------------------------------
@@ -372,6 +395,9 @@ fn build_request_body(
         model: model_name.to_string(),
         messages,
         stream: true,
+        // Every request streams on the wire, `ask` included, so both paths can
+        // be handed the provider's own counts instead of a chars/4 guess.
+        stream_options: StreamOptions { include_usage: true },
         temperature: config.temperature,
         top_p: config.top_p,
         reasoning_effort: config.reasoning_effort.clone(),
@@ -396,12 +422,26 @@ pub(crate) struct ChatCompletionRequest {
     pub model: String,
     pub messages: Vec<serde_json::Value>,
     pub stream: bool,
+    pub stream_options: StreamOptions,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct StreamOptions {
+    pub include_usage: bool,
+}
+
+/// Strips `stream_options` from a prepared body, reporting whether it was there.
+/// Some OpenAI-compatible endpoints reject the field with a 400.
+pub(crate) fn drop_stream_options(body: &mut serde_json::Value) -> bool {
+    body.as_object_mut()
+        .and_then(|object| object.remove("stream_options"))
+        .is_some()
 }
 
 // --- SSE parsing -----------------------------------------------------------
@@ -416,6 +456,38 @@ struct SseFrame {
     /// behind aliases and proxies. Absent on providers that omit it.
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    usage: Option<SseUsage>,
+}
+
+#[derive(Default, Deserialize)]
+struct SseUsage {
+    #[serde(default)]
+    prompt_tokens: Option<usize>,
+    #[serde(default)]
+    completion_tokens: Option<usize>,
+}
+
+/// Token counts as the provider reported them; a field is None when it said
+/// nothing about that side.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ReportedUsage {
+    pub prompt_tokens: Option<usize>,
+    pub completion_tokens: Option<usize>,
+}
+
+/// Reported counts win field by field; whatever the provider omitted falls back
+/// to the estimate. The third element says whether any field was estimated.
+pub(crate) fn resolve_usage_tokens(
+    reported: ReportedUsage,
+    estimated_input: usize,
+    estimated_output: usize,
+) -> (usize, usize, bool) {
+    (
+        reported.prompt_tokens.unwrap_or(estimated_input),
+        reported.completion_tokens.unwrap_or(estimated_output),
+        reported.prompt_tokens.is_none() || reported.completion_tokens.is_none(),
+    )
 }
 
 #[derive(Default, Deserialize)]
@@ -449,6 +521,7 @@ struct SseParser {
     think_filter: ThinkTagFilter,
     finish_reason: Option<String>,
     resolved_model: Option<String>,
+    reported_usage: ReportedUsage,
     tools: crate::toolcall::ToolCallAccumulator,
 }
 
@@ -459,6 +532,7 @@ impl SseParser {
             think_filter: ThinkTagFilter::new(),
             finish_reason: None,
             resolved_model: None,
+            reported_usage: ReportedUsage::default(),
             tools: crate::toolcall::ToolCallAccumulator::default(),
         }
     }
@@ -476,6 +550,12 @@ impl SseParser {
     /// The server-reported model, from the first frame that names one.
     fn resolved_model(&self) -> Option<&str> {
         self.resolved_model.as_deref()
+    }
+
+    /// Token counts the provider reported, merged across every frame that
+    /// carried a `usage` object.
+    fn reported_usage(&self) -> ReportedUsage {
+        self.reported_usage
     }
 
     fn feed(&mut self, bytes: &[u8]) -> Vec<Result<StreamChunk, Error>> {
@@ -530,6 +610,17 @@ impl SseParser {
                 .filter(|model| !model.is_empty() && model != "keepalive");
         }
 
+        // Providers may split the two counts across frames, so fields merge
+        // individually rather than replacing the pair.
+        if let Some(usage) = frame.usage {
+            if usage.prompt_tokens.is_some() {
+                self.reported_usage.prompt_tokens = usage.prompt_tokens;
+            }
+            if usage.completion_tokens.is_some() {
+                self.reported_usage.completion_tokens = usage.completion_tokens;
+            }
+        }
+
         if let Some(err) = frame.error {
             let message = if err.message.is_empty() {
                 "unknown error".to_string()
@@ -576,6 +667,7 @@ pub(crate) struct SseOutcome {
     pub ttft: Option<Duration>,
     pub finish_reason: Option<String>,
     pub resolved_model: Option<String>,
+    pub reported_usage: ReportedUsage,
     pub tool_calls: Vec<ToolCall>,
 }
 
@@ -621,6 +713,7 @@ async fn consume_sse_stream(
         ttft,
         finish_reason: parser.finish_reason().map(str::to_string),
         resolved_model: parser.resolved_model().map(str::to_string),
+        reported_usage: parser.reported_usage(),
         tool_calls: parser.tool_calls(),
     })
 }
@@ -636,6 +729,7 @@ async fn process_sse_task(
         if let Ok(mut tail) = tail.lock() {
             tail.finish_reason = parser.finish_reason().map(str::to_string);
             tail.resolved_model = parser.resolved_model().map(str::to_string);
+            tail.reported_usage = parser.reported_usage();
             tail.tool_calls = parser.tool_calls();
         }
     };
@@ -705,10 +799,22 @@ async fn process_sse_task(
 pub(crate) struct StreamTail {
     finish_reason: Option<String>,
     resolved_model: Option<String>,
+    reported_usage: ReportedUsage,
     tool_calls: Vec<ToolCall>,
 }
 
 pub(crate) type SharedTail = std::sync::Arc<std::sync::Mutex<StreamTail>>;
+
+/// Everything `StreamResponse::new` needs from the dispatch that produced it.
+pub(crate) struct StreamInit {
+    pub rx: mpsc::Receiver<Result<StreamChunk, Error>>,
+    pub tail: SharedTail,
+    pub model: String,
+    pub model_name: String,
+    pub provider: String,
+    pub api_key_hint: String,
+    pub input_tokens: usize,
+}
 
 pub struct StreamResponse {
     tail: SharedTail,
@@ -716,6 +822,7 @@ pub struct StreamResponse {
     model: String,
     model_name: String,
     provider: String,
+    api_key_hint: String,
     reasoning: String,
     input_chars: usize,
     output_chars: usize,
@@ -725,22 +832,16 @@ pub struct StreamResponse {
 }
 
 impl StreamResponse {
-    pub(crate) fn new(
-        rx: mpsc::Receiver<Result<StreamChunk, Error>>,
-        model: String,
-        model_name: String,
-        provider: String,
-        input_tokens: usize,
-        tail: SharedTail,
-    ) -> Self {
+    pub(crate) fn new(init: StreamInit) -> Self {
         Self {
-            tail,
-            rx: tokio_stream::wrappers::ReceiverStream::new(rx),
-            model,
-            model_name,
-            provider,
+            tail: init.tail,
+            rx: tokio_stream::wrappers::ReceiverStream::new(init.rx),
+            model: init.model,
+            model_name: init.model_name,
+            provider: init.provider,
+            api_key_hint: init.api_key_hint,
             reasoning: String::new(),
-            input_chars: input_tokens.saturating_mul(4),
+            input_chars: init.input_tokens.saturating_mul(4),
             output_chars: 0,
             start: Instant::now(),
             first_token_time: None,
@@ -798,16 +899,29 @@ impl StreamResponse {
     }
 
     pub fn usage(&self) -> Usage {
+        let (input_tokens, output_tokens, estimated) = self.resolved_tokens();
         Usage {
             provider: self.provider.clone(),
             model: self.model.clone(),
             model_name: self.model_name.clone(),
-            api_key_hint: String::new(),
-            input_tokens: self.input_chars / 4,
-            output_tokens: self.output_chars / 4,
+            api_key_hint: self.api_key_hint.clone(),
+            input_tokens,
+            output_tokens,
+            estimated,
             duration: self.start.elapsed(),
             ttft: self.first_token_time.map(|t| t.duration_since(self.start)),
         }
+    }
+
+    /// Token counts as they stand now: exact where the provider reported them,
+    /// estimated otherwise. Reported counts only arrive with the final frames.
+    fn resolved_tokens(&self) -> (usize, usize, bool) {
+        let reported = self
+            .tail
+            .lock()
+            .map(|tail| tail.reported_usage)
+            .unwrap_or_default();
+        resolve_usage_tokens(reported, self.input_chars / 4, self.output_chars / 4)
     }
 }
 
@@ -830,14 +944,16 @@ impl Stream for StreamResponse {
                     self.metrics_logged = true;
                     let total = self.start.elapsed();
                     let ttft = self.first_token_time.map(|t| t.duration_since(self.start));
+                    let (input_tokens, output_tokens, estimated) = self.resolved_tokens();
                     log::info!(
                         "{}",
                         format_metrics(
                             &self.model_name,
-                            self.input_chars / 4,
-                            self.output_chars / 4,
+                            input_tokens,
+                            output_tokens,
                             total,
                             ttft,
+                            estimated,
                         )
                     );
                 }
