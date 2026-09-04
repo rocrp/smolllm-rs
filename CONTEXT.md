@@ -9,7 +9,7 @@ A named OpenAI-compatible endpoint (e.g. `openai`, `groq`); credentials and base
 _Avoid_: vendor, backend.
 
 **Model spec**:
-The user-facing model string `provider/model`, or bare `model` (no `/`) — bare form has no provider and resolves base URL/API key from explicit builder options only, never env. Comma-separated specs form a fallback chain; may mix both forms. Explicit base URL applies to every leg. (No per-leg `!effort` suffix in this port.)
+The user-facing model string `provider/model`, or bare `model` (no `/`) — bare form has no provider and resolves base URL/API key from explicit builder options only, never env. Comma-separated specs form a fallback chain; may mix both forms. Explicit base URL applies to every leg. A leg may carry a `!effort` suffix (`proxy/gpt-5!high`) that overrides the call-level reasoning effort for that leg alone and never reaches the wire; a suffix with nothing after the `!` is rejected as a typo rather than ignored.
 
 **Fallback chain**:
 Ordered or weighted candidate models; on failure the call advances to the next candidate. A leg counts as failed until it delivers its first chunk — an HTTP error, an error frame after a 200, a dropped connection, or a stream that ends empty all advance the chain. Once content has reached the consumer the chain is committed: a later failure surfaces as a stream error carrying the Partial output, because splicing a second model onto half an answer is worse than failing.

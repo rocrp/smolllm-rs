@@ -162,7 +162,7 @@ impl Dispatch {
         let (chosen_key, chosen_url) = balancer::choose_pair(&api_keys, &resolved.base_urls)?;
         let request_url = resolved.endpoint_for(&chosen_url).url;
         let parsed = resolved.parsed;
-        let body = build_request_body(&parsed.model_name, config)?;
+        let body = build_request_body(&parsed.model_name, parsed.reasoning_effort.as_deref(), config)?;
         let input_tokens = estimate_tokens(&serde_json::to_string(&body).unwrap_or_default());
         Ok(Self {
             model_str: model_str.to_string(),
@@ -408,6 +408,7 @@ async fn take_first_chunk(
 
 fn build_request_body(
     model_name: &str,
+    leg_effort: Option<&str>,
     config: &RequestConfig,
 ) -> Result<serde_json::Value, Error> {
     let mut messages = Vec::new();
@@ -480,7 +481,10 @@ fn build_request_body(
         stream_options: StreamOptions { include_usage: true },
         temperature: config.temperature,
         top_p: config.top_p,
-        reasoning_effort: config.reasoning_effort.clone(),
+        // The leg's own `!effort` suffix wins over the call-level setting.
+        reasoning_effort: leg_effort
+            .map(str::to_string)
+            .or_else(|| config.reasoning_effort.clone()),
     };
     let mut body = serde_json::to_value(request)?;
 

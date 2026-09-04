@@ -121,7 +121,18 @@ fn config_with(prompt: &str) -> RequestConfig {
 }
 
 fn body_json(config: &RequestConfig) -> serde_json::Value {
-    build_request_body("m", config).expect("body builds")
+    build_request_body("m", None, config).expect("body builds")
+}
+
+/// The body a model spec produces, with its `!effort` suffix applied.
+fn body_for_spec(spec: &str, config: &RequestConfig) -> serde_json::Value {
+    let parsed = crate::provider::parse_model_string(spec).expect("spec parses");
+    build_request_body(
+        &parsed.model_name,
+        parsed.reasoning_effort.as_deref(),
+        config,
+    )
+    .expect("body builds")
 }
 
 #[test]
@@ -771,5 +782,55 @@ async fn a_stream_that_stopped_without_a_finish_reason_is_truncated() {
     assert!(
         response.truncated(),
         "an SSE stream that ends without its terminal frame was cut off"
+    );
+}
+
+// --- rs#11: per-leg !effort suffix ------------------------------------------
+
+#[test]
+fn a_leg_suffix_sets_the_reasoning_effort_and_leaves_the_model_clean() {
+    let body = body_for_spec("x/m!high", &config_with("hi"));
+    assert_eq!(body["model"], json!("m"), "the suffix never reaches the wire");
+    assert_eq!(body["reasoning_effort"], json!("high"));
+}
+
+#[test]
+fn a_leg_suffix_overrides_the_call_level_effort() {
+    let mut config = config_with("hi");
+    config.reasoning_effort = Some("low".into());
+
+    assert_eq!(body_for_spec("x/a!none", &config)["reasoning_effort"], json!("none"));
+    assert_eq!(
+        body_for_spec("x/b", &config)["reasoning_effort"],
+        json!("low"),
+        "a leg without a suffix keeps the call-level effort"
+    );
+}
+
+#[test]
+fn a_bare_model_takes_a_suffix_too() {
+    let parsed = crate::provider::parse_model_string("qwen3!none").expect("parses");
+    assert_eq!(parsed.model_name, "qwen3");
+    assert_eq!(parsed.provider_name, "");
+    assert_eq!(parsed.reasoning_effort.as_deref(), Some("none"));
+}
+
+#[test]
+fn an_empty_effort_suffix_is_rejected_at_parse_time() {
+    let err = crate::provider::parse_model_string("x/m!").expect_err("empty effort is a typo");
+    assert!(
+        matches!(&err, crate::Error::InvalidModel(msg) if msg.contains("x/m!")),
+        "{err}"
+    );
+}
+
+#[test]
+fn resolved_endpoints_report_the_model_without_its_suffix() {
+    let endpoints = crate::resolve_endpoints("x/m!high", Some("https://gateway.example"))
+        .expect("resolves");
+    assert_eq!(endpoints[0].model, "m");
+    assert_eq!(
+        endpoints[0].url,
+        "https://gateway.example/v1/chat/completions"
     );
 }

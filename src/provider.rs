@@ -73,10 +73,31 @@ pub struct ParsedModel {
     pub provider_name: String,
     pub model_name: String,
     pub base_url: String,
+    /// The leg's own `!effort` suffix, overriding the call-level setting.
+    pub reasoning_effort: Option<String>,
+}
+
+/// Splits a `!effort` suffix off a model spec. The suffix belongs to this leg
+/// alone, so a chain can mix efforts: `proxy/qwen3!none,proxy/gpt-5!high`.
+fn split_effort_suffix(spec: &str) -> Result<(&str, Option<String>), Error> {
+    let Some((model, effort)) = spec.split_once('!') else {
+        return Ok((spec, None));
+    };
+    let effort = effort.trim();
+    if effort.is_empty() {
+        return Err(Error::InvalidModel(format!(
+            "missing reasoning effort after '!' in '{spec}'"
+        )));
+    }
+    Ok((model.trim(), Some(effort.to_string())))
 }
 
 pub fn parse_model_string(model: &str) -> Result<ParsedModel, Error> {
     let model = model.trim();
+    if model.is_empty() {
+        return Err(Error::InvalidModel("model string must not be empty".into()));
+    }
+    let (model, reasoning_effort) = split_effort_suffix(model)?;
     if model.is_empty() {
         return Err(Error::InvalidModel("model string must not be empty".into()));
     }
@@ -87,6 +108,7 @@ pub fn parse_model_string(model: &str) -> Result<ParsedModel, Error> {
             provider_name: String::new(),
             model_name: model.to_string(),
             base_url: String::new(),
+            reasoning_effort,
         });
     };
 
@@ -110,6 +132,7 @@ pub fn parse_model_string(model: &str) -> Result<ParsedModel, Error> {
         provider_name: provider_name.to_string(),
         model_name: model_name.to_string(),
         base_url: base_url.to_string(),
+        reasoning_effort,
     })
 }
 
