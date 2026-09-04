@@ -105,6 +105,95 @@ fn format_duration(d: Duration) -> String {
     }
 }
 
+/// Provider error bodies get logged and stored on errors, and they routinely
+/// echo the request's own credentials back. 500 characters is enough to
+/// diagnose one and short enough to keep out of a terminal-sized error line.
+const MAX_ERROR_DETAIL: usize = 500;
+const REDACTED: &str = "[REDACTED_CREDENTIAL]";
+
+/// Word characters end at anything a JSON body or header line uses to separate
+/// a value from its surroundings, so a redacted value stops at the quote or
+/// comma that follows it.
+fn is_delimiter(c: char) -> bool {
+    c.is_whitespace() || matches!(c, ',' | '"' | '\'' | '{' | '}' | '[' | ']' | '(' | ')' | ':' | '=' | ';')
+}
+
+/// Names that introduce a credential when followed by `:` or `=`.
+fn is_credential_name(word: &str) -> bool {
+    [
+        "api_key",
+        "api-key",
+        "apikey",
+        "access_token",
+        "access-token",
+        "accesstoken",
+        "token",
+        "key",
+    ]
+    .iter()
+    .any(|name| word.eq_ignore_ascii_case(name))
+}
+
+/// Shapes that are a secret wherever they appear, with no name to introduce them.
+fn looks_like_secret(word: &str) -> bool {
+    if word.starts_with("AIza") && word.len() >= 16 {
+        return true;
+    }
+    ["sk-", "ghp_", "gho_", "ghu_", "ghs_", "ghr_"]
+        .iter()
+        .any(|prefix| word.starts_with(prefix) && word.len() >= prefix.len() + 10)
+}
+
+/// Replaces credentials a provider echoed back with a marker. Handles the three
+/// shapes that actually turn up in error bodies: a `Bearer` token, a named
+/// assignment such as `api_key=...`, and bare keys with a known prefix.
+pub fn redact_credentials(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    let mut redact_this_word = false;
+
+    while !rest.is_empty() {
+        let word_start = rest.find(|c: char| !is_delimiter(c)).unwrap_or(rest.len());
+        let (delimiters, tail) = rest.split_at(word_start);
+        out.push_str(delimiters);
+        if tail.is_empty() {
+            break;
+        }
+
+        let word_end = tail.find(is_delimiter).unwrap_or(tail.len());
+        let (word, after) = tail.split_at(word_end);
+        if redact_this_word || looks_like_secret(word) {
+            out.push_str(REDACTED);
+        } else {
+            out.push_str(word);
+        }
+
+        let next_word_at = after.find(|c: char| !is_delimiter(c)).unwrap_or(after.len());
+        let separator = &after[..next_word_at];
+        redact_this_word = word.eq_ignore_ascii_case("bearer")
+            || (is_credential_name(word) && separator.contains([':', '=']));
+        rest = after;
+    }
+    out
+}
+
+/// A provider error body made safe to keep: credentials removed, whitespace
+/// collapsed, and capped so one HTML error page cannot flood a log.
+pub fn brief_error_detail(text: &str) -> String {
+    let detail = redact_credentials(text)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if detail.is_empty() {
+        return "no detail".to_string();
+    }
+    if detail.chars().count() <= MAX_ERROR_DETAIL {
+        return detail;
+    }
+    let head: String = detail.chars().take(MAX_ERROR_DETAIL - 3).collect();
+    format!("{head}...")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,6 +212,28 @@ mod tests {
     fn test_estimate_tokens() {
         assert_eq!(estimate_tokens(""), 0);
         assert_eq!(estimate_tokens("hello world!"), 3);
+    }
+
+    #[test]
+    fn credentials_never_survive_an_error_body() {
+        let redacted = redact_credentials(
+            r#"{"error":"bad key","headers":{"Authorization":"Bearer sk-live-abcdef123456"}}"#,
+        );
+        assert!(!redacted.contains("sk-live-abcdef123456"), "{redacted}");
+        assert!(redacted.contains(REDACTED));
+
+        assert!(!redact_credentials("api_key=AIzaSyA1234567890abcdef").contains("AIzaSyA"));
+        assert!(!redact_credentials("used sk-0123456789abcdef here").contains("sk-01234"));
+    }
+
+    #[test]
+    fn error_detail_is_collapsed_and_capped() {
+        assert_eq!(brief_error_detail("  bad\n  request\t "), "bad request");
+        assert_eq!(brief_error_detail("   "), "no detail");
+
+        let long = brief_error_detail(&"x".repeat(2_000));
+        assert_eq!(long.chars().count(), MAX_ERROR_DETAIL);
+        assert!(long.ends_with("..."));
     }
 
     #[test]

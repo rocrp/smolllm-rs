@@ -19,7 +19,7 @@ _Avoid_: confusing with retry.
 What a stream delivered to the consumer before it failed; carried on the error so the caller keeps what arrived.
 
 **Retry**:
-Re-attempt of the *same* model after a transient failure. Distinct from fallback (which switches models).
+Re-attempt of the *same* model after a transient failure, with backoff. Distinct from fallback (which switches models), and yields to it: while another leg remains, a transient failure advances the Fallback chain immediately instead of sleeping. The backoff is for the last leg, where there is nothing else to try.
 
 **Balancer pair**:
 One (API key, base URL) combination for a provider; the least-used pair is chosen per call.

@@ -83,10 +83,12 @@ fn applies_the_complete_request_url_grammar() {
             "https://gateway.example/openai/",
             "https://gateway.example/openai/chat/completions",
         ),
+        // Only `v` plus digits is a version segment, so `/v1beta` is an ordinary
+        // path and still gets `/v1` appended — the rule the Python port uses.
         (
             "custom",
             "https://gateway.example/v1beta",
-            "https://gateway.example/v1beta/chat/completions",
+            "https://gateway.example/v1beta/v1/chat/completions",
         ),
         (
             "anthropic",

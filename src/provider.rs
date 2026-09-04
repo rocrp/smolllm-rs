@@ -200,14 +200,19 @@ pub fn resolve_api_key(parsed: &ParsedModel, explicit: Option<&str>) -> Result<S
     })
 }
 
+/// A path ends in a version segment only when its last part is `v` followed by
+/// digits alone, so `/v1` and `/v3` count while `/v1beta` does not — the same
+/// `/v\d+$` rule the Python port uses.
 fn has_version_suffix(url: &str) -> bool {
     let trimmed = url.trim_end_matches('/');
     let last = match trimmed.rsplit('/').next() {
         Some(s) => s,
         None => return false,
     };
-    let mut chars = last.chars();
-    matches!(chars.next(), Some('v')) && chars.next().is_some_and(|c| c.is_ascii_digit())
+    let Some(digits) = last.strip_prefix('v') else {
+        return false;
+    };
+    !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
 }
 
 pub fn build_request_url(base_url: &str, provider_name: &str) -> String {

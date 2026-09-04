@@ -81,6 +81,27 @@ pub enum ModelInput {
 }
 
 impl ModelInput {
+    /// Rejects an empty leg, so `"x/a,,x/b"` fails the same way it already does
+    /// through `validate` and `resolve_endpoints` instead of silently becoming a
+    /// two-leg chain.
+    pub fn validate(&self) -> Result<(), crate::Error> {
+        let models: Vec<&String> = match self {
+            ModelInput::Sequential(models) | ModelInput::Random(models) => models.iter().collect(),
+            ModelInput::Weighted(models) => models.iter().map(|(model, _)| model).collect(),
+        };
+        if models.is_empty() {
+            return Err(crate::Error::InvalidModelList {
+                reason: "value must not be empty".into(),
+            });
+        }
+        if models.iter().any(|model| model.trim().is_empty()) {
+            return Err(crate::Error::InvalidModelList {
+                reason: "list contains empty entry".into(),
+            });
+        }
+        Ok(())
+    }
+
     pub fn into_selector(self) -> Box<dyn ModelSelector> {
         match self {
             ModelInput::Sequential(models) => Box::new(SequentialSelector::new(models)),
@@ -92,11 +113,9 @@ impl ModelInput {
 
 impl From<&str> for ModelInput {
     fn from(s: &str) -> Self {
-        let models: Vec<String> = s
-            .split(',')
-            .map(|m| m.trim().to_string())
-            .filter(|m| !m.is_empty())
-            .collect();
+        // Empty entries are kept so `validate` can reject them; dropping one here
+        // would silently turn a typo into a shorter chain.
+        let models: Vec<String> = s.split(',').map(|m| m.trim().to_string()).collect();
         ModelInput::Sequential(models)
     }
 }

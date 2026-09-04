@@ -834,3 +834,69 @@ fn resolved_endpoints_report_the_model_without_its_suffix() {
         "https://gateway.example/v1/chat/completions"
     );
 }
+
+// --- rs#12: parity hygiene --------------------------------------------------
+
+#[test]
+fn an_empty_leg_is_rejected_instead_of_shortening_the_chain() {
+    let err = crate::selector::ModelInput::from("x/a,,x/b")
+        .validate()
+        .expect_err("an empty entry is a typo, not a two-leg chain");
+    assert!(
+        matches!(&err, crate::Error::InvalidModelList { reason } if reason.contains("empty entry")),
+        "{err}"
+    );
+    crate::selector::ModelInput::from("x/a,x/b")
+        .validate()
+        .expect("a well-formed chain still validates");
+}
+
+#[test]
+fn a_stream_error_frame_is_redacted_and_capped() {
+    let mut parser = SseParser::new();
+    let results = feed_frame(
+        &mut parser,
+        r#"{"error":{"message":"rejected Authorization: Bearer sk-live-abcdef123456"}}"#,
+    );
+    let err = results
+        .into_iter()
+        .next()
+        .expect("an error frame yields an error")
+        .expect_err("it is an error");
+    let text = err.to_string();
+    assert!(!text.contains("sk-live-abcdef123456"), "{text}");
+    assert!(text.contains("[REDACTED_CREDENTIAL]"), "{text}");
+}
+
+#[test]
+fn a_rate_limited_leg_yields_to_the_next_model_instead_of_waiting() {
+    use super::should_retry;
+    let rate_limited = crate::Error::Http {
+        status: 429,
+        body: "slow down".into(),
+    };
+
+    assert!(
+        !should_retry(&rate_limited, 0, true),
+        "another model is sitting right behind this one; do not sleep on it"
+    );
+    assert!(
+        should_retry(&rate_limited, 0, false),
+        "on the last leg the backoff is all there is"
+    );
+    assert!(
+        !should_retry(&rate_limited, super::MAX_RETRIES - 1, false),
+        "retry budget spent"
+    );
+    assert!(
+        !should_retry(
+            &crate::Error::Http {
+                status: 400,
+                body: "nope".into()
+            },
+            0,
+            false
+        ),
+        "a 400 is not transient"
+    );
+}

@@ -59,12 +59,14 @@ where
     F: for<'a> Fn(Dispatch, reqwest::Response, Instant, &'a RequestConfig) -> FinalizeFut<'a, R>,
 {
     let model_input = config.resolve_model_input().ok_or(Error::NoValidModels)?;
+    model_input.validate()?;
     let mut selector = model_input.into_selector();
     let client = config.http_client.clone().unwrap_or_default();
 
     let mut last_err: Option<Error> = None;
     while let Some(model_str) = selector.next_model() {
-        let attempt = dispatch_one(&model_str, config, &client, &finalize).await;
+        let more_legs = selector.has_more();
+        let attempt = dispatch_one(&model_str, config, &client, &finalize, more_legs).await;
         match attempt {
             Ok(response) => {
                 // A stream reports only once exhausted, so it fires its own.
@@ -93,6 +95,7 @@ async fn dispatch_one<R, F>(
     config: &RequestConfig,
     client: &reqwest::Client,
     finalize: &F,
+    more_legs: bool,
 ) -> Result<R, Box<AttemptFailure>>
 where
     F: for<'a> Fn(Dispatch, reqwest::Response, Instant, &'a RequestConfig) -> FinalizeFut<'a, R>,
@@ -128,7 +131,7 @@ where
             },
         })
     };
-    let response = match send_with_retry(client, &mut dispatch, config.timeout).await {
+    let response = match send_with_retry(client, &mut dispatch, config.timeout, more_legs).await {
         Ok(response) => response,
         Err(error) => return Err(fail(error)),
     };
@@ -189,10 +192,17 @@ impl Dispatch {
 
 // --- HTTP send with retry --------------------------------------------------
 
+/// Sends one leg, retrying transient failures with backoff.
+///
+/// `more_legs` short-circuits that backoff: waiting 2s, then 6s, then 18s on a
+/// rate-limited provider makes no sense while another model is sitting right
+/// behind it, so the chain advances instead. The backoff is for the last leg,
+/// where there is nothing else to try.
 async fn send_with_retry(
     client: &reqwest::Client,
     dispatch: &mut Dispatch,
     timeout: Duration,
+    more_legs: bool,
 ) -> Result<reqwest::Response, Error> {
     let mut last_err: Option<Error> = None;
     let mut may_drop_stream_options = true;
@@ -223,7 +233,7 @@ async fn send_with_retry(
             Ok(r) => r,
             Err(e) => {
                 let err = Error::Request(e);
-                if err.is_retryable() && attempt < MAX_RETRIES - 1 {
+                if should_retry(&err, attempt, more_legs) {
                     last_err = Some(err);
                     attempt += 1;
                     continue;
@@ -248,9 +258,9 @@ async fn send_with_retry(
             }
             let err = Error::Http {
                 status,
-                body: body_text,
+                body: brief_error_detail(&body_text),
             };
-            if err.is_retryable() && attempt < MAX_RETRIES - 1 {
+            if should_retry(&err, attempt, more_legs) {
                 last_err = Some(err);
                 attempt += 1;
                 continue;
@@ -261,6 +271,11 @@ async fn send_with_retry(
         return Ok(resp);
     }
     Err(last_err.unwrap_or(Error::Other("max retries exhausted".into())))
+}
+
+/// Whether to retry the same leg rather than advance the chain.
+pub(crate) fn should_retry(error: &Error, attempt: usize, more_legs: bool) -> bool {
+    !more_legs && error.is_retryable() && attempt < MAX_RETRIES - 1
 }
 
 fn retry_delay(attempt: usize) -> Duration {
@@ -712,7 +727,7 @@ impl SseParser {
                 err.message
             };
             return Err(Error::Stream {
-                message,
+                message: brief_error_detail(&message),
                 partial: String::new(),
             });
         }
