@@ -25,9 +25,19 @@ async fn main() -> Result<(), smolllm::Error> {
         println!("\nReasoning: {}", stream.reasoning());
     }
 
+    println!("Requested: {}", stream.model());
+    match stream.resolved_model() {
+        Some(resolved) => println!("Server answered with: {resolved}"),
+        None => println!("Server reported no model of its own"),
+    }
+    if stream.truncated() {
+        println!("WARNING: the answer was cut short");
+    }
+
     let usage = stream.usage();
+    let approx = if usage.estimated { "~" } else { "" };
     println!(
-        "Tokens: {} in / {} out, Duration: {:?}",
+        "Tokens: {approx}{} in / {approx}{} out, Duration: {:?}",
         usage.input_tokens, usage.output_tokens, usage.duration
     );
 
