@@ -131,7 +131,7 @@ macro_rules! shared_setters {
             }
 
             pub fn hook(mut self, hook: impl Fn(RequestEvent) + Send + Sync + 'static) -> Self {
-                self.config.hook = Some(Box::new(hook));
+                self.config.hook = Some(std::sync::Arc::new(hook));
                 self
             }
 

@@ -12,8 +12,11 @@ _Avoid_: vendor, backend.
 The user-facing model string `provider/model`, or bare `model` (no `/`) — bare form has no provider and resolves base URL/API key from explicit builder options only, never env. Comma-separated specs form a fallback chain; may mix both forms. Explicit base URL applies to every leg. (No per-leg `!effort` suffix in this port.)
 
 **Fallback chain**:
-Ordered or weighted candidate models; on failure the call advances to the next candidate.
+Ordered or weighted candidate models; on failure the call advances to the next candidate. A leg counts as failed until it delivers its first chunk — an HTTP error, an error frame after a 200, a dropped connection, or a stream that ends empty all advance the chain. Once content has reached the consumer the chain is committed: a later failure surfaces as a stream error carrying the Partial output, because splicing a second model onto half an answer is worse than failing.
 _Avoid_: confusing with retry.
+
+**Partial output**:
+What a stream delivered to the consumer before it failed; carried on the error so the caller keeps what arrived.
 
 **Retry**:
 Re-attempt of the *same* model after a transient failure. Distinct from fallback (which switches models).

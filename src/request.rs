@@ -24,7 +24,7 @@ pub(crate) struct RequestConfig {
     /// last so the caller wins. Validated by the builder setter.
     pub extra_body: Option<serde_json::Value>,
     pub handler: Option<Box<ChunkHandler>>,
-    pub hook: Option<Box<EventHook>>,
+    pub hook: Option<std::sync::Arc<EventHook>>,
     pub http_client: Option<reqwest::Client>,
 }
 

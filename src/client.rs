@@ -14,7 +14,7 @@ use crate::endpoint::resolve_model;
 use crate::error::Error;
 use crate::image::image_to_data_url;
 use crate::provider::{resolve_api_key, ParsedModel};
-use crate::request::RequestConfig;
+use crate::request::{EventHook, RequestConfig};
 use crate::think::ThinkTagFilter;
 use crate::toolcall::ToolCall;
 use crate::types::*;
@@ -36,8 +36,8 @@ pub(crate) async fn execute_ask(config: RequestConfig) -> Result<LLMResponse, Er
 }
 
 pub(crate) async fn execute_stream(config: RequestConfig) -> Result<StreamResponse, Error> {
-    run_with_fallback(&config, |dispatch, response, started, _config| {
-        Box::pin(stream_finalize(dispatch, response, started))
+    run_with_fallback(&config, |dispatch, response, started, config| {
+        Box::pin(stream_finalize(dispatch, response, started, config))
     })
     .await
 }
@@ -46,9 +46,16 @@ pub(crate) async fn execute_stream(config: RequestConfig) -> Result<StreamRespon
 
 type FinalizeFut<'a, R> = Pin<Box<dyn Future<Output = Result<R, Error>> + Send + 'a>>;
 
+/// A failed attempt, with the identity of the leg that failed so the hook can
+/// name it.
+struct AttemptFailure {
+    error: Error,
+    usage: Usage,
+}
+
 async fn run_with_fallback<R, F>(config: &RequestConfig, finalize: F) -> Result<R, Error>
 where
-    R: HasUsage,
+    R: Finalized,
     F: for<'a> Fn(Dispatch, reqwest::Response, Instant, &'a RequestConfig) -> FinalizeFut<'a, R>,
 {
     let model_input = config.resolve_model_input().ok_or(Error::NoValidModels)?;
@@ -60,17 +67,21 @@ where
         let attempt = dispatch_one(&model_str, config, &client, &finalize).await;
         match attempt {
             Ok(response) => {
-                fire_hook(config, response.usage(), None);
+                // A stream reports only once exhausted, so it fires its own.
+                if let Some(usage) = response.success_usage() {
+                    fire_hook(config, usage, None);
+                }
                 return Ok(response);
             }
-            Err(err) => {
+            Err(failure) => {
+                let AttemptFailure { error, usage } = *failure;
                 if selector.has_more() {
-                    log::warn!("Model {model_str} failed, trying fallback: {err}");
+                    log::warn!("Model {model_str} failed, trying fallback: {error}");
                 } else {
-                    log::warn!("Model {model_str} failed: {err}");
+                    log::warn!("Model {model_str} failed: {error}");
                 }
-                fire_hook(config, Usage::default(), Some(err.to_string()));
-                last_err = Some(err);
+                fire_hook(config, usage, Some(error.to_string()));
+                last_err = Some(error);
             }
         }
     }
@@ -82,11 +93,23 @@ async fn dispatch_one<R, F>(
     config: &RequestConfig,
     client: &reqwest::Client,
     finalize: &F,
-) -> Result<R, Error>
+) -> Result<R, Box<AttemptFailure>>
 where
     F: for<'a> Fn(Dispatch, reqwest::Response, Instant, &'a RequestConfig) -> FinalizeFut<'a, R>,
 {
-    let mut dispatch = Dispatch::prepare(model_str, config)?;
+    let mut dispatch = match Dispatch::prepare(model_str, config) {
+        Ok(dispatch) => dispatch,
+        // Nothing was sent, so the only identity we have is what was asked for.
+        Err(error) => {
+            return Err(Box::new(AttemptFailure {
+                error,
+                usage: Usage {
+                    model: model_str.to_string(),
+                    ..Usage::default()
+                },
+            }))
+        }
+    };
     log::info!(
         "Sending request: url={} model={} key={} approx_tokens={}",
         dispatch.request_url,
@@ -95,8 +118,21 @@ where
         dispatch.input_tokens,
     );
     let started = Instant::now();
-    let response = send_with_retry(client, &mut dispatch, config.timeout).await?;
-    finalize(dispatch, response, started, config).await
+    let identity = dispatch.usage_identity();
+    let fail = |error: Error| {
+        Box::new(AttemptFailure {
+            error,
+            usage: Usage {
+                duration: started.elapsed(),
+                ..identity.clone()
+            },
+        })
+    };
+    let response = match send_with_retry(client, &mut dispatch, config.timeout).await {
+        Ok(response) => response,
+        Err(error) => return Err(fail(error)),
+    };
+    finalize(dispatch, response, started, config).await.map_err(fail)
 }
 
 fn fire_hook(config: &RequestConfig, usage: Usage, error: Option<String>) {
@@ -136,6 +172,18 @@ impl Dispatch {
             body,
             input_tokens,
         })
+    }
+
+    /// Who this attempt was, for a hook that has to report a failure.
+    fn usage_identity(&self) -> Usage {
+        Usage {
+            provider: self.parsed.provider_name.clone(),
+            model: self.model_str.clone(),
+            model_name: self.parsed.model_name.clone(),
+            api_key_hint: preview_api_key(&self.chosen_key),
+            input_tokens: self.input_tokens,
+            ..Usage::default()
+        }
     }
 }
 
@@ -302,16 +350,23 @@ async fn ask_finalize(
 async fn stream_finalize(
     dispatch: Dispatch,
     response: reqwest::Response,
-    _started: Instant,
+    started: Instant,
+    config: &RequestConfig,
 ) -> Result<StreamResponse, Error> {
     let byte_stream = response.bytes_stream();
-    let (tx, rx) = mpsc::channel::<Result<StreamChunk, Error>>(SSE_CHANNEL_CAPACITY);
+    let (tx, mut rx) = mpsc::channel::<Result<StreamChunk, Error>>(SSE_CHANNEL_CAPACITY);
     let tail: SharedTail = std::sync::Arc::new(std::sync::Mutex::new(StreamTail::default()));
 
     let task_tail = std::sync::Arc::clone(&tail);
     tokio::spawn(async move {
         process_sse_task(byte_stream, tx, task_tail).await;
     });
+
+    // A 200 proves nothing: a proxy can still answer with an error frame, drop
+    // the connection, or stream nothing at all. Waiting here for the first chunk
+    // keeps all of that inside the fallback chain — past this point output has
+    // been delivered and switching models would splice two answers together.
+    let first = take_first_chunk(&mut rx, &dispatch.model_str).await?;
 
     Ok(StreamResponse::new(StreamInit {
         rx,
@@ -321,7 +376,25 @@ async fn stream_finalize(
         provider: dispatch.parsed.provider_name,
         api_key_hint: preview_api_key(&dispatch.chosen_key),
         input_tokens: dispatch.input_tokens,
+        start: started,
+        first: Some(first),
+        hook: config.hook.clone(),
     }))
+}
+
+/// Awaits the first item of a stream: a chunk, the failure that came instead, or
+/// `EmptyResponse` for a stream that ended without producing anything.
+async fn take_first_chunk(
+    rx: &mut mpsc::Receiver<Result<StreamChunk, Error>>,
+    model: &str,
+) -> Result<StreamChunk, Error> {
+    match rx.recv().await {
+        Some(Ok(chunk)) => Ok(chunk),
+        Some(Err(error)) => Err(error),
+        None => Err(Error::EmptyResponse {
+            model: model.to_string(),
+        }),
+    }
 }
 
 // --- Request body construction ---------------------------------------------
@@ -814,6 +887,11 @@ pub(crate) struct StreamInit {
     pub provider: String,
     pub api_key_hint: String,
     pub input_tokens: usize,
+    /// When the request was sent, so duration and ttft include connect time.
+    pub start: Instant,
+    /// The chunk already taken off the channel to prove the leg works.
+    pub first: Option<StreamChunk>,
+    pub hook: Option<std::sync::Arc<EventHook>>,
 }
 
 pub struct StreamResponse {
@@ -824,11 +902,16 @@ pub struct StreamResponse {
     provider: String,
     api_key_hint: String,
     reasoning: String,
+    /// Everything handed to the consumer so far, so a mid-stream failure can
+    /// report what did arrive.
+    delivered: String,
+    first: Option<StreamChunk>,
+    hook: Option<std::sync::Arc<EventHook>>,
     input_chars: usize,
     output_chars: usize,
     start: Instant,
     first_token_time: Option<Instant>,
-    metrics_logged: bool,
+    finished: bool,
 }
 
 impl StreamResponse {
@@ -841,11 +924,14 @@ impl StreamResponse {
             provider: init.provider,
             api_key_hint: init.api_key_hint,
             reasoning: String::new(),
+            delivered: String::new(),
+            first: init.first,
+            hook: init.hook,
             input_chars: init.input_tokens.saturating_mul(4),
             output_chars: 0,
-            start: Instant::now(),
+            start: init.start,
             first_token_time: None,
-            metrics_logged: false,
+            finished: false,
         }
     }
 
@@ -925,38 +1011,67 @@ impl StreamResponse {
     }
 }
 
+impl StreamResponse {
+    /// Records a chunk on its way to the consumer.
+    fn account(&mut self, chunk: &StreamChunk) {
+        if self.first_token_time.is_none() && !chunk.content.is_empty() {
+            self.first_token_time = Some(Instant::now());
+        }
+        self.output_chars += chunk.content.len() + chunk.reasoning.len();
+        self.reasoning.push_str(&chunk.reasoning);
+        self.delivered.push_str(&chunk.content);
+    }
+
+    /// Ends the attempt exactly once: logs its metrics and fires the hook.
+    fn finish(&mut self, error: Option<String>) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        let usage = self.usage();
+        log::info!(
+            "{}",
+            format_metrics(
+                &self.model_name,
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.duration,
+                usage.ttft,
+                usage.estimated,
+            )
+        );
+        if let Some(hook) = self.hook.clone() {
+            hook(RequestEvent { usage, error });
+        }
+    }
+}
+
 impl Stream for StreamResponse {
     type Item = Result<StreamChunk, Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if let Some(chunk) = self.first.take() {
+            self.account(&chunk);
+            return Poll::Ready(Some(Ok(chunk)));
+        }
         match Pin::new(&mut self.rx).poll_next(cx) {
             Poll::Ready(Some(Ok(chunk))) => {
-                if self.first_token_time.is_none() && !chunk.content.is_empty() {
-                    self.first_token_time = Some(Instant::now());
-                }
-                self.output_chars += chunk.content.len() + chunk.reasoning.len();
-                self.reasoning.push_str(&chunk.reasoning);
+                self.account(&chunk);
                 Poll::Ready(Some(Ok(chunk)))
             }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
+            // Only reachable once content has been delivered: a failure before
+            // that was consumed by `take_first_chunk` and fell back instead. The
+            // consumer keeps what arrived.
+            Poll::Ready(Some(Err(error))) => {
+                let message = error.to_string();
+                self.finish(Some(message.clone()));
+                Poll::Ready(Some(Err(Error::Stream {
+                    message,
+                    partial: self.delivered.clone(),
+                })))
+            }
             Poll::Ready(None) => {
-                if !self.metrics_logged {
-                    self.metrics_logged = true;
-                    let total = self.start.elapsed();
-                    let ttft = self.first_token_time.map(|t| t.duration_since(self.start));
-                    let (input_tokens, output_tokens, estimated) = self.resolved_tokens();
-                    log::info!(
-                        "{}",
-                        format_metrics(
-                            &self.model_name,
-                            input_tokens,
-                            output_tokens,
-                            total,
-                            ttft,
-                            estimated,
-                        )
-                    );
-                }
+                self.finish(None);
                 Poll::Ready(None)
             }
             Poll::Pending => Poll::Pending,
@@ -964,19 +1079,24 @@ impl Stream for StreamResponse {
     }
 }
 
-trait HasUsage {
-    fn usage(&self) -> Usage;
+/// What the fallback driver needs from a finished attempt.
+trait Finalized {
+    /// Usage to report for a successful attempt, or None when the value fires
+    /// its own hook later.
+    fn success_usage(&self) -> Option<Usage>;
 }
 
-impl HasUsage for LLMResponse {
-    fn usage(&self) -> Usage {
-        self.usage.clone()
+impl Finalized for LLMResponse {
+    fn success_usage(&self) -> Option<Usage> {
+        Some(self.usage.clone())
     }
 }
 
-impl HasUsage for StreamResponse {
-    fn usage(&self) -> Usage {
-        StreamResponse::usage(self)
+impl Finalized for StreamResponse {
+    /// None: a stream has produced nothing yet, so its hook fires at exhaustion
+    /// with real counts rather than here with zeros.
+    fn success_usage(&self) -> Option<Usage> {
+        None
     }
 }
 

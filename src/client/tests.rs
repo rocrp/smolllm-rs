@@ -38,17 +38,31 @@ fn test_init(rx: mpsc::Receiver<Result<crate::StreamChunk, crate::Error>>, tail:
         provider: "custom".into(),
         api_key_hint: crate::utils::preview_api_key("sk-1234567890abcdef"),
         input_tokens: 0,
+        start: std::time::Instant::now(),
+        first: None,
+        hook: None,
     }
 }
 
-/// A `StreamResponse` fed by one fixed SSE buffer.
-async fn collect_stream(bytes: &'static [u8]) -> StreamResponse {
+/// Runs the SSE task over one fixed buffer, handing back what a dispatch would.
+fn spawn_sse(
+    bytes: &'static [u8],
+) -> (
+    mpsc::Receiver<Result<crate::StreamChunk, crate::Error>>,
+    SharedTail,
+) {
     let stream = StaticByteStream {
         chunks: vec![Bytes::from_static(bytes)].into_iter(),
     };
     let (tx, rx) = mpsc::channel(16);
     let tail = shared_tail();
     tokio::spawn(process_sse_task(stream, tx, std::sync::Arc::clone(&tail)));
+    (rx, tail)
+}
+
+/// A `StreamResponse` fed by one fixed SSE buffer.
+async fn collect_stream(bytes: &'static [u8]) -> StreamResponse {
+    let (rx, tail) = spawn_sse(bytes);
     StreamResponse::new(test_init(rx, tail))
 }
 
@@ -543,4 +557,163 @@ fn estimated_metrics_are_marked_approximate() {
     let approx = crate::utils::format_metrics("m", 10, 5, Duration::from_secs(1), None, true);
     assert!(!exact.contains('~'), "{exact}");
     assert!(approx.contains("~15tok"), "{approx}");
+}
+
+// --- rs#8: stream fallback, honest timing, hook after exhaustion ------------
+
+use crate::request::EventHook;
+use crate::types::RequestEvent;
+use std::sync::{Arc, Mutex};
+
+fn recording_hook() -> (Arc<EventHook>, Arc<Mutex<Vec<RequestEvent>>>) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    let hook: Arc<EventHook> = Arc::new(move |event: RequestEvent| {
+        sink.lock().expect("hook sink").push(event);
+    });
+    (hook, seen)
+}
+
+#[tokio::test]
+async fn a_failure_before_any_chunk_is_reported_so_the_chain_can_advance() {
+    let (mut rx, _tail) = spawn_sse(b"data: {\"error\":{\"message\":\"upstream exploded\"}}\n");
+
+    let err = super::take_first_chunk(&mut rx, "x/a")
+        .await
+        .expect_err("an error frame before any content fails the leg");
+    assert!(err.to_string().contains("upstream exploded"), "{err}");
+}
+
+#[tokio::test]
+async fn a_stream_that_ends_without_chunks_is_an_empty_response() {
+    let (mut rx, _tail) = spawn_sse(b"data: [DONE]\n");
+
+    let err = super::take_first_chunk(&mut rx, "x/a")
+        .await
+        .expect_err("a 200 that streams nothing is a failed leg, not a success");
+    assert!(
+        matches!(&err, crate::Error::EmptyResponse { model } if model == "x/a"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn the_first_chunk_is_replayed_before_the_rest_of_the_stream() {
+    let (mut rx, tail) = spawn_sse(
+        concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"one \"}}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"two\"}}]}\n",
+        )
+        .as_bytes(),
+    );
+    let first = super::take_first_chunk(&mut rx, "x/a")
+        .await
+        .expect("first chunk");
+    let mut response = StreamResponse::new(StreamInit {
+        first: Some(first),
+        ..test_init(rx, tail)
+    });
+
+    let mut text = String::new();
+    while let Some(chunk) = response.next().await {
+        text.push_str(&chunk.expect("chunk").content);
+    }
+    assert_eq!(text, "one two", "the peeked chunk must not be swallowed");
+}
+
+#[tokio::test]
+async fn an_error_after_the_first_chunk_carries_the_partial_output() {
+    let mut response = collect_stream(
+        concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"half an answer\"}}]}\n",
+            "data: {\"error\":{\"message\":\"connection reset\"}}\n",
+        )
+        .as_bytes(),
+    )
+    .await;
+
+    let first = response.next().await.expect("chunk").expect("ok");
+    assert_eq!(first.content, "half an answer");
+
+    let err = response
+        .next()
+        .await
+        .expect("the error reaches the consumer")
+        .expect_err("second item is the failure");
+    let crate::Error::Stream { message, partial } = err else {
+        panic!("post-content failures keep the partial output: {err:?}")
+    };
+    assert!(message.contains("connection reset"), "{message}");
+    assert_eq!(partial, "half an answer");
+}
+
+#[tokio::test]
+async fn the_hook_fires_once_the_stream_is_exhausted() {
+    let (hook, seen) = recording_hook();
+    let (rx, tail) = spawn_sse(
+        concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":22}}\n",
+        )
+        .as_bytes(),
+    );
+    let mut response = StreamResponse::new(StreamInit {
+        hook: Some(hook),
+        ..test_init(rx, tail)
+    });
+
+    assert!(seen.lock().unwrap().is_empty(), "nothing fires mid-stream");
+    while response.next().await.is_some() {}
+
+    let events = seen.lock().unwrap();
+    assert_eq!(events.len(), 1, "exactly one event per attempt");
+    assert!(events[0].error.is_none());
+    assert_eq!(events[0].usage.output_tokens, 22, "real counts, not zeros");
+    assert_eq!(events[0].usage.model, "custom/model");
+}
+
+#[tokio::test]
+async fn the_hook_fires_with_the_error_when_a_stream_fails_midway() {
+    let (hook, seen) = recording_hook();
+    let (rx, tail) = spawn_sse(
+        concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"half\"}}]}\n",
+            "data: {\"error\":{\"message\":\"boom\"}}\n",
+        )
+        .as_bytes(),
+    );
+    let mut response = StreamResponse::new(StreamInit {
+        hook: Some(hook),
+        ..test_init(rx, tail)
+    });
+
+    while response.next().await.is_some() {}
+
+    let events = seen.lock().unwrap();
+    assert_eq!(events.len(), 1);
+    assert!(
+        events[0].error.as_deref().is_some_and(|e| e.contains("boom")),
+        "{:?}",
+        events[0].error
+    );
+}
+
+#[tokio::test]
+async fn stream_timing_starts_before_the_request_is_sent() {
+    let start = std::time::Instant::now()
+        .checked_sub(Duration::from_millis(500))
+        .expect("clock supports a half-second offset");
+    let (rx, tail) = spawn_sse(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n");
+    let mut response = StreamResponse::new(StreamInit {
+        start,
+        ..test_init(rx, tail)
+    });
+
+    while response.next().await.is_some() {}
+
+    assert!(
+        response.usage().duration >= Duration::from_millis(500),
+        "duration must include connect and header wait, got {:?}",
+        response.usage().duration
+    );
 }
