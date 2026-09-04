@@ -28,6 +28,13 @@ Token counts derived by heuristic; this port never reads provider-reported usage
 Model thinking text, kept in a channel separate from content.
 _Avoid_: mixing reasoning into content.
 
+**ResolvedModel**:
+The model the server reports as having produced a response, read from the wire's top-level `model` field; differs from the requested Model spec behind aliases and proxies, and is absent when the backend reports none. The `keepalive` sentinel omlx emits is transport, not identity, and never counts.
+_Avoid_: actual model (that is the resolved-or-requested identity below), real model.
+
+**Actual model**:
+Best available identity of the model that produced a response: the ResolvedModel when the server named one, otherwise the requested Model spec.
+
 **FinishReason**:
 Verbatim provider string explaining why generation ended; never normalized.
 

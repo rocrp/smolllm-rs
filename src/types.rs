@@ -156,6 +156,10 @@ pub struct LLMResponse {
     pub reasoning: String,
     /// Verbatim provider string explaining why generation ended; never normalized.
     pub finish_reason: Option<String>,
+    /// The model the server reported as having produced this response; differs
+    /// from the requested `model` behind aliases and proxies. None when the
+    /// backend reports no model.
+    pub resolved_model: Option<String>,
     /// Empty unless the model answered with tool calls. Executing them and
     /// replaying the result is the caller's job — the library runs no loop.
     pub tool_calls: Vec<ToolCall>,
@@ -163,6 +167,14 @@ pub struct LLMResponse {
     pub model_name: String,
     pub provider: String,
     pub usage: Usage,
+}
+
+impl LLMResponse {
+    /// Best available identity of the model that produced this response: the
+    /// ResolvedModel when the server named one, else the requested spec.
+    pub fn actual_model(&self) -> &str {
+        self.resolved_model.as_deref().unwrap_or(&self.model)
+    }
 }
 
 #[derive(Debug, Clone)]

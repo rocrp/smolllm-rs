@@ -223,6 +223,7 @@ async fn ask_finalize(
         reasoning,
         ttft,
         finish_reason,
+        resolved_model,
         tool_calls,
     } = outcome;
 
@@ -258,6 +259,7 @@ async fn ask_finalize(
         text: content,
         reasoning,
         finish_reason,
+        resolved_model,
         tool_calls,
         model: dispatch.model_str.clone(),
         model_name: dispatch.parsed.model_name.clone(),
@@ -410,6 +412,10 @@ struct SseFrame {
     error: Option<SseError>,
     #[serde(default)]
     choices: Vec<SseChoice>,
+    /// The model the server says is answering; differs from the requested spec
+    /// behind aliases and proxies. Absent on providers that omit it.
+    #[serde(default)]
+    model: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -442,6 +448,7 @@ struct SseParser {
     buffer: Vec<u8>,
     think_filter: ThinkTagFilter,
     finish_reason: Option<String>,
+    resolved_model: Option<String>,
     tools: crate::toolcall::ToolCallAccumulator,
 }
 
@@ -451,6 +458,7 @@ impl SseParser {
             buffer: Vec::new(),
             think_filter: ThinkTagFilter::new(),
             finish_reason: None,
+            resolved_model: None,
             tools: crate::toolcall::ToolCallAccumulator::default(),
         }
     }
@@ -463,6 +471,11 @@ impl SseParser {
     /// The provider's finish reason, verbatim; None until a frame carries one.
     fn finish_reason(&self) -> Option<&str> {
         self.finish_reason.as_deref()
+    }
+
+    /// The server-reported model, from the first frame that names one.
+    fn resolved_model(&self) -> Option<&str> {
+        self.resolved_model.as_deref()
     }
 
     fn feed(&mut self, bytes: &[u8]) -> Vec<Result<StreamChunk, Error>> {
@@ -510,6 +523,13 @@ impl SseParser {
     fn parse_sse_data(&mut self, data: &str) -> Result<Option<StreamChunk>, Error> {
         let frame: SseFrame = serde_json::from_str(data)?;
 
+        if self.resolved_model.is_none() {
+            // `keepalive` is omlx's transport sentinel, not a model identity.
+            self.resolved_model = frame
+                .model
+                .filter(|model| !model.is_empty() && model != "keepalive");
+        }
+
         if let Some(err) = frame.error {
             let message = if err.message.is_empty() {
                 "unknown error".to_string()
@@ -555,6 +575,7 @@ pub(crate) struct SseOutcome {
     pub reasoning: String,
     pub ttft: Option<Duration>,
     pub finish_reason: Option<String>,
+    pub resolved_model: Option<String>,
     pub tool_calls: Vec<ToolCall>,
 }
 
@@ -599,6 +620,7 @@ async fn consume_sse_stream(
         reasoning: reasoning.trim().to_string(),
         ttft,
         finish_reason: parser.finish_reason().map(str::to_string),
+        resolved_model: parser.resolved_model().map(str::to_string),
         tool_calls: parser.tool_calls(),
     })
 }
@@ -613,7 +635,20 @@ async fn process_sse_task(
     let record = |parser: &SseParser| {
         if let Ok(mut tail) = tail.lock() {
             tail.finish_reason = parser.finish_reason().map(str::to_string);
+            tail.resolved_model = parser.resolved_model().map(str::to_string);
             tail.tool_calls = parser.tool_calls();
+        }
+    };
+    // The resolved model is published as soon as a frame names it, so a consumer
+    // can show it mid-stream rather than only after exhaustion.
+    let publish_model = |parser: &SseParser| {
+        let Some(model) = parser.resolved_model() else {
+            return;
+        };
+        if let Ok(mut tail) = tail.lock() {
+            if tail.resolved_model.is_none() {
+                tail.resolved_model = Some(model.to_string());
+            }
         }
     };
     tokio::pin!(byte_stream);
@@ -630,7 +665,9 @@ async fn process_sse_task(
 
         match result {
             Ok(bytes) => {
-                for chunk_result in parser.feed(&bytes) {
+                let parsed = parser.feed(&bytes);
+                publish_model(&parser);
+                for chunk_result in parsed {
                     match chunk_result {
                         Ok(chunk) => {
                             if tx.send(Ok(chunk)).await.is_err() {
@@ -667,6 +704,7 @@ async fn process_sse_task(
 #[derive(Default)]
 pub(crate) struct StreamTail {
     finish_reason: Option<String>,
+    resolved_model: Option<String>,
     tool_calls: Vec<ToolCall>,
 }
 
@@ -733,6 +771,21 @@ impl StreamResponse {
             .lock()
             .map(|tail| tail.finish_reason.clone())
             .unwrap_or_default()
+    }
+
+    /// The model the server reported as answering, available as soon as a frame
+    /// names one. None when the backend reports no model.
+    pub fn resolved_model(&self) -> Option<String> {
+        self.tail
+            .lock()
+            .map(|tail| tail.resolved_model.clone())
+            .unwrap_or_default()
+    }
+
+    /// Best available identity of the model that produced this response: the
+    /// ResolvedModel when the server named one, else the requested spec.
+    pub fn actual_model(&self) -> String {
+        self.resolved_model().unwrap_or_else(|| self.model.clone())
     }
 
     /// Tool calls the model requested, assembled from streamed deltas. Empty

@@ -308,3 +308,94 @@ fn replayed_tool_conversation_serializes_losslessly() {
     assert_eq!(messages[2]["tool_call_id"], json!("call_1"));
     assert_eq!(messages[2]["content"], json!(r#"{"temp_c":18}"#));
 }
+
+// --- rs#6: ResolvedModel ----------------------------------------------------
+
+#[test]
+fn parser_reports_the_model_the_server_says_answered() {
+    let mut parser = SseParser::new();
+    feed_frame(
+        &mut parser,
+        r#"{"model":"gpt-5!high","choices":[{"delta":{"content":"hi"}}]}"#,
+    );
+    assert_eq!(parser.resolved_model(), Some("gpt-5!high"));
+}
+
+#[test]
+fn parser_keeps_the_first_reported_model() {
+    let mut parser = SseParser::new();
+    feed_frame(&mut parser, r#"{"model":"first","choices":[{"delta":{"content":"a"}}]}"#);
+    feed_frame(&mut parser, r#"{"model":"second","choices":[{"delta":{"content":"b"}}]}"#);
+    assert_eq!(parser.resolved_model(), Some("first"));
+}
+
+#[test]
+fn parser_ignores_the_omlx_keepalive_sentinel() {
+    let mut parser = SseParser::new();
+    feed_frame(
+        &mut parser,
+        r#"{"model":"keepalive","choices":[{"delta":{"content":""}}]}"#,
+    );
+    assert_eq!(parser.resolved_model(), None, "keepalive is transport, not identity");
+    feed_frame(
+        &mut parser,
+        r#"{"model":"Qwen3.8-27B-4bit","choices":[{"delta":{"content":"hello"}}]}"#,
+    );
+    assert_eq!(parser.resolved_model(), Some("Qwen3.8-27B-4bit"));
+}
+
+#[test]
+fn parser_ignores_an_empty_model_field() {
+    let mut parser = SseParser::new();
+    feed_frame(&mut parser, r#"{"model":"","choices":[{"delta":{"content":"hi"}}]}"#);
+    assert_eq!(parser.resolved_model(), None);
+}
+
+#[test]
+fn parser_has_no_resolved_model_when_frames_omit_it() {
+    let mut parser = SseParser::new();
+    feed_frame(&mut parser, r#"{"choices":[{"delta":{"content":"hi"}}]}"#);
+    assert_eq!(parser.resolved_model(), None);
+}
+
+#[tokio::test]
+async fn stream_response_reports_the_resolved_model_before_it_is_exhausted() {
+    let stream = OneThenPendingByteStream {
+        next: Some(Bytes::from_static(
+            b"data: {\"model\":\"gpt-5!high\",\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n",
+        )),
+    };
+    let (tx, rx) = mpsc::channel(1);
+    let tail: super::SharedTail =
+        std::sync::Arc::new(std::sync::Mutex::new(super::StreamTail::default()));
+    tokio::spawn(process_sse_task(stream, tx, std::sync::Arc::clone(&tail)));
+    let mut response = StreamResponse::new(
+        rx,
+        "smolserver/summary".into(),
+        "summary".into(),
+        "smolserver".into(),
+        0,
+        tail,
+    );
+
+    let chunk = timeout(Duration::from_secs(1), response.next())
+        .await
+        .expect("first chunk arrives")
+        .unwrap()
+        .unwrap();
+    assert_eq!(chunk.content, "hello");
+    assert_eq!(response.resolved_model().as_deref(), Some("gpt-5!high"));
+    assert_eq!(response.actual_model(), "gpt-5!high");
+}
+
+#[tokio::test]
+async fn actual_model_falls_back_to_the_requested_spec() {
+    let (tx, rx) = mpsc::channel::<Result<crate::StreamChunk, crate::Error>>(1);
+    drop(tx);
+    let tail: super::SharedTail =
+        std::sync::Arc::new(std::sync::Mutex::new(super::StreamTail::default()));
+    let response = StreamResponse::new(rx, "gemini/flash".into(), "flash".into(), "gemini".into(), 0, tail);
+
+    assert_eq!(response.resolved_model(), None);
+    assert_eq!(response.actual_model(), "gemini/flash");
+}
