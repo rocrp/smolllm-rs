@@ -747,7 +747,7 @@ impl SseParser {
 /// dropped or the upstream cut it off. No content at all is the empty-response
 /// case, handled separately.
 pub(crate) fn is_truncated(finish_reason: Option<&str>, has_content: bool) -> bool {
-    has_content && finish_reason.is_none_or(|reason| reason == "length")
+    has_content && matches!(finish_reason, None | Some("length"))
 }
 
 /// Everything a consumed (non-streaming) response yielded.
