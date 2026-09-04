@@ -44,6 +44,9 @@ Best available identity of the model that produced a response: the ResolvedModel
 **FinishReason**:
 Verbatim provider string explaining why generation ended; never normalized.
 
+**Truncation**:
+An answer cut short rather than ended: the FinishReason is `length`, or a stream carried content and then ended with no FinishReason at all, having lost its terminal frame. A response with no content is the empty case, not a truncated one. `ask` treats a truncated leg as failed and advances the Fallback chain; a stream reports it, since its output has already been delivered.
+
 **Request hook**:
 Per-attempt observation callback receiving usage or error; the library's only telemetry surface.
 

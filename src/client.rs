@@ -305,6 +305,13 @@ async fn ask_finalize(
         });
     }
 
+    // A capped answer is a failed leg: the next model may have room to finish.
+    if is_truncated(finish_reason.as_deref(), !content.trim().is_empty()) {
+        return Err(Error::Truncated {
+            model: dispatch.model_str,
+        });
+    }
+
     let total = started.elapsed();
     let (input_tokens, output_tokens, estimated) = resolve_usage_tokens(
         reported_usage,
@@ -733,6 +740,16 @@ impl SseParser {
     }
 }
 
+/// Whether a response was cut short rather than ending naturally.
+///
+/// `length` is the provider saying it hit its output cap. Content with no finish
+/// reason at all means the stream lost its terminal frame: the connection
+/// dropped or the upstream cut it off. No content at all is the empty-response
+/// case, handled separately.
+pub(crate) fn is_truncated(finish_reason: Option<&str>, has_content: bool) -> bool {
+    has_content && finish_reason.is_none_or(|reason| reason == "length")
+}
+
 /// Everything a consumed (non-streaming) response yielded.
 pub(crate) struct SseOutcome {
     pub content: String,
@@ -973,6 +990,12 @@ impl StreamResponse {
     /// ResolvedModel when the server named one, else the requested spec.
     pub fn actual_model(&self) -> String {
         self.resolved_model().unwrap_or_else(|| self.model.clone())
+    }
+
+    /// Whether the answer was cut short: the provider hit its output cap, or the
+    /// stream ended without its terminal frame. Final once exhausted.
+    pub fn truncated(&self) -> bool {
+        is_truncated(self.finish_reason().as_deref(), !self.delivered.is_empty())
     }
 
     /// Tool calls the model requested, assembled from streamed deltas. Empty

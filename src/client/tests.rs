@@ -717,3 +717,59 @@ async fn stream_timing_starts_before_the_request_is_sent() {
         response.usage().duration
     );
 }
+
+// --- rs#9: truncation -------------------------------------------------------
+
+#[test]
+fn truncation_is_a_cap_hit_or_a_stream_that_lost_its_final_frame() {
+    use super::is_truncated;
+
+    assert!(is_truncated(Some("length"), true), "the provider hit its cap");
+    assert!(!is_truncated(Some("stop"), true), "a natural ending is not truncation");
+    assert!(!is_truncated(Some("tool_calls"), true));
+    assert!(
+        is_truncated(None, true),
+        "content but no finish reason means the stream was cut off"
+    );
+    assert!(
+        !is_truncated(None, false),
+        "nothing at all is the empty-response case, not truncation"
+    );
+    assert!(!is_truncated(Some("length"), false));
+}
+
+#[tokio::test]
+async fn a_stream_capped_by_the_provider_reports_truncated() {
+    let mut response = collect_stream(concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"cut off mid-\"}}]}\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n",
+    ).as_bytes())
+    .await;
+    while response.next().await.is_some() {}
+
+    assert!(response.truncated());
+}
+
+#[tokio::test]
+async fn a_stream_that_ended_naturally_is_not_truncated() {
+    let mut response = collect_stream(concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"all of it\"}}]}\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n",
+    ).as_bytes())
+    .await;
+    while response.next().await.is_some() {}
+
+    assert!(!response.truncated());
+}
+
+#[tokio::test]
+async fn a_stream_that_stopped_without_a_finish_reason_is_truncated() {
+    let mut response =
+        collect_stream(b"data: {\"choices\":[{\"delta\":{\"content\":\"and then\"}}]}\n").await;
+    while response.next().await.is_some() {}
+
+    assert!(
+        response.truncated(),
+        "an SSE stream that ends without its terminal frame was cut off"
+    );
+}

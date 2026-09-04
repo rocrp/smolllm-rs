@@ -44,6 +44,9 @@ pub enum Error {
     #[error("no valid models configured")]
     NoValidModels,
 
+    #[error("model {model} was cut off before finishing")]
+    Truncated { model: String },
+
     #[error("stream error: {message}")]
     Stream { message: String, partial: String },
 
