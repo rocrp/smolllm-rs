@@ -746,6 +746,7 @@ impl SseParser {
             return Err(Error::Stream {
                 message: brief_error_detail(&message),
                 partial: String::new(),
+                source: None,
             });
         }
 
@@ -1132,6 +1133,7 @@ impl Stream for StreamResponse {
                 Poll::Ready(Some(Err(Error::Stream {
                     message,
                     partial: self.delivered.clone(),
+                    source: Some(Box::new(error)),
                 })))
             }
             Poll::Ready(None) => {

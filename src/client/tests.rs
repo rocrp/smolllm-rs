@@ -651,11 +651,64 @@ async fn an_error_after_the_first_chunk_carries_the_partial_output() {
         .await
         .expect("the error reaches the consumer")
         .expect_err("second item is the failure");
-    let crate::Error::Stream { message, partial } = err else {
+    let crate::Error::Stream { message, partial, .. } = err else {
         panic!("post-content failures keep the partial output: {err:?}")
     };
     assert!(message.contains("connection reset"), "{message}");
     assert_eq!(partial, "half an answer");
+}
+
+#[tokio::test]
+async fn a_timeout_after_content_keeps_its_type_and_partial_output() {
+    // Create the deadline, then let it expire before polling the request.
+    // reqwest checks the deadline before its network future, so no server is needed.
+    let pending = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("request client")
+        .get("http://127.0.0.1:1")
+        .timeout(Duration::ZERO)
+        .send();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let timeout_error = pending.await.expect_err("expired request deadline");
+    assert!(timeout_error.is_timeout(), "{timeout_error:?}");
+
+    let bytes = b"data: {\"choices\":[{\"delta\":{\"content\":\"half an answer\"}}]}\n";
+    let byte_stream = tokio_stream::iter(vec![Ok(Bytes::from_static(bytes)), Err(timeout_error)]);
+    let (tx, rx) = mpsc::channel(2);
+    let tail = shared_tail();
+    tokio::spawn(process_sse_task(
+        byte_stream,
+        tx,
+        std::sync::Arc::clone(&tail),
+    ));
+    let mut response = StreamResponse::new(test_init(rx, tail));
+
+    assert_eq!(
+        response
+            .next()
+            .await
+            .expect("first chunk")
+            .expect("content")
+            .content,
+        "half an answer"
+    );
+    let error = response
+        .next()
+        .await
+        .expect("timeout reaches the consumer")
+        .expect_err("body read failed");
+    assert!(error.is_timeout(), "post-content timeout must remain typed");
+    let crate::Error::Stream {
+        partial,
+        source: Some(source),
+        ..
+    } = error
+    else {
+        panic!("post-content failure must retain its source: {error:?}")
+    };
+    assert_eq!(partial, "half an answer");
+    assert!(matches!(*source, crate::Error::Request(_)));
 }
 
 #[tokio::test]

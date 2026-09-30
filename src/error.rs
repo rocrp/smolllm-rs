@@ -48,7 +48,13 @@ pub enum Error {
     Truncated { model: String },
 
     #[error("stream error: {message}")]
-    Stream { message: String, partial: String },
+    Stream {
+        message: String,
+        partial: String,
+        /// Original error when this wraps a failure after content was delivered.
+        #[source]
+        source: Option<Box<Error>>,
+    },
 
     #[error("image error: {0}")]
     Image(String),
@@ -67,6 +73,18 @@ pub enum Error {
 }
 
 impl Error {
+    /// Whether this error, including a failure after streamed content, is a timeout.
+    pub fn is_timeout(&self) -> bool {
+        match self {
+            Error::Request(error) => error.is_timeout(),
+            Error::Stream {
+                source: Some(source),
+                ..
+            } => source.is_timeout(),
+            _ => false,
+        }
+    }
+
     pub fn is_retryable(&self) -> bool {
         match self {
             Error::Http { status, .. } => matches!(status, 429 | 500 | 502 | 503 | 529),
