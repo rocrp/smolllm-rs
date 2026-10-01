@@ -1074,3 +1074,96 @@ fn an_effort_suffix_is_lowercased_for_the_wire() {
         json!("high")
     );
 }
+
+// --- Commit rule: answer content delivered to an `ask` handler -------------
+
+async fn consume_with(
+    bytes: &'static [u8],
+    handler: Option<&(dyn Fn(&crate::StreamChunk) + Send + Sync)>,
+) -> Result<super::SseOutcome, crate::Error> {
+    let stream = StaticByteStream {
+        chunks: vec![Bytes::from_static(bytes)].into_iter(),
+    };
+    super::consume_sse_stream(stream, handler, std::time::Instant::now()).await
+}
+
+const CONTENT_THEN_ERROR: &[u8] = concat!(
+    r#"data: {"model":"a","choices":[{"delta":{"content":"half"}}]}"#,
+    "\n",
+    r#"data: {"model":"a","choices":[{"delta":{},"finish_reason":"error"}],"error":{"message":"upstream died","type":"upstream_error"}}"#,
+    "\n",
+    "data: [DONE]\n",
+)
+.as_bytes();
+
+#[tokio::test]
+async fn content_delivered_to_a_handler_ends_the_chain() {
+    let seen = Mutex::new(String::new());
+    let handler = |chunk: &crate::StreamChunk| seen.lock().unwrap().push_str(&chunk.content);
+
+    let error = consume_with(CONTENT_THEN_ERROR, Some(&handler))
+        .await
+        .err()
+        .expect("the error frame fails the leg");
+
+    assert!(super::delivered_content(&error), "{error}");
+    assert!(error.to_string().contains("upstream died"), "{error}");
+    match error {
+        crate::Error::Stream { partial, .. } => assert_eq!(partial, "half"),
+        other => panic!("expected a stream error, got {other}"),
+    }
+    assert_eq!(*seen.lock().unwrap(), "half");
+}
+
+#[tokio::test]
+async fn without_a_handler_the_chain_advances() {
+    let error = consume_with(CONTENT_THEN_ERROR, None)
+        .await
+        .err()
+        .expect("the error frame fails the leg");
+    assert!(
+        !super::delivered_content(&error),
+        "nothing reached the caller: {error}"
+    );
+}
+
+#[tokio::test]
+async fn reasoning_delivered_to_a_handler_does_not_commit() {
+    let handler = |_: &crate::StreamChunk| {};
+    let error = consume_with(
+        concat!(
+            r#"data: {"model":"a","choices":[{"delta":{"reasoning_content":"thinking"}}]}"#,
+            "\n",
+            r#"data: {"model":"a","choices":[{"delta":{},"finish_reason":"error"}],"error":{"message":"upstream died"}}"#,
+            "\n",
+        )
+        .as_bytes(),
+        Some(&handler),
+    )
+    .await
+    .err()
+    .expect("the error frame fails the leg");
+    assert!(!super::delivered_content(&error), "{error}");
+}
+
+#[test]
+fn a_truncated_answer_a_handler_saw_ends_the_chain() {
+    let truncated = || crate::Error::Truncated {
+        model: "x/a".into(),
+    };
+    assert!(super::delivered_content(&super::commit_to_handler(
+        truncated(),
+        true,
+        "cut"
+    )));
+    assert!(!super::delivered_content(&super::commit_to_handler(
+        truncated(),
+        false,
+        "cut"
+    )));
+    assert!(!super::delivered_content(&super::commit_to_handler(
+        truncated(),
+        true,
+        ""
+    )));
+}

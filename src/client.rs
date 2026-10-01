@@ -77,12 +77,16 @@ where
             }
             Err(failure) => {
                 let AttemptFailure { error, usage } = *failure;
-                if selector.has_more() {
+                let ends_chain = delivered_content(&error);
+                if selector.has_more() && !ends_chain {
                     log::warn!("Model {model_str} failed, trying fallback: {error}");
                 } else {
                     log::warn!("Model {model_str} failed: {error}");
                 }
                 fire_hook(config, usage, Some(error.to_string()));
+                if ends_chain {
+                    return Err(error);
+                }
                 last_err = Some(error);
             }
         }
@@ -135,7 +139,30 @@ where
         Ok(response) => response,
         Err(error) => return Err(fail(error)),
     };
-    finalize(dispatch, response, started, config).await.map_err(fail)
+    finalize(dispatch, response, started, config)
+        .await
+        .map_err(fail)
+}
+
+/// Whether a failure came after answer content reached the caller. Such a
+/// failure ends the chain: falling back would splice a second model's answer
+/// onto what the caller already has.
+pub(crate) fn delivered_content(error: &Error) -> bool {
+    matches!(error, Error::Stream { partial, .. } if !partial.is_empty())
+}
+
+/// Wraps a failure that came after a handler received answer `content`, so the
+/// fallback driver stops there (see `delivered_content`). Without a handler, or
+/// with only reasoning delivered, the error passes through and the chain moves on.
+pub(crate) fn commit_to_handler(error: Error, has_handler: bool, content: &str) -> Error {
+    if !has_handler || content.is_empty() {
+        return error;
+    }
+    Error::Stream {
+        message: error.to_string(),
+        partial: content.to_string(),
+        source: Some(Box::new(error)),
+    }
 }
 
 fn fire_hook(config: &RequestConfig, usage: Usage, error: Option<String>) {
@@ -324,9 +351,10 @@ async fn ask_finalize(
     let produced_output =
         !content.trim().is_empty() || !reasoning.trim().is_empty() || !tool_calls.is_empty();
     if is_truncated(finish_reason.as_deref(), produced_output) {
-        return Err(Error::Truncated {
+        let error = Error::Truncated {
             model: dispatch.model_str,
-        });
+        };
+        return Err(commit_to_handler(error, config.handler.is_some(), &content));
     }
 
     let total = started.elapsed();
@@ -813,10 +841,13 @@ async fn consume_sse_stream(
 
     tokio::pin!(byte_stream);
 
+    // Content already handed to the handler commits the call to this model.
+    let has_handler = handler.is_some();
     while let Some(result) = byte_stream.next().await {
-        let bytes = result?;
+        let bytes =
+            result.map_err(|e| commit_to_handler(Error::Request(e), has_handler, &content))?;
         for chunk_result in parser.feed(&bytes) {
-            let chunk = chunk_result?;
+            let chunk = chunk_result.map_err(|e| commit_to_handler(e, has_handler, &content))?;
             if first_token_time.is_none() && !chunk.content.is_empty() {
                 first_token_time = Some(Instant::now());
             }

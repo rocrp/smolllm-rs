@@ -12,7 +12,7 @@ _Avoid_: vendor, backend.
 The user-facing model string `provider/model`, or bare `model` (no `/`) — bare form has no provider and resolves base URL/API key from explicit builder options only, never env. Comma-separated specs form a fallback chain; may mix both forms. Explicit base URL applies to every leg. A leg may carry a `!effort` suffix (`proxy/gpt-5!high`) that overrides the call-level reasoning effort for that leg alone, is lowercased, and never reaches the wire; a suffix with nothing after the `!` is rejected up front as a typo rather than ignored, so it cannot be mistaken for a failed leg and fall through to the next model.
 
 **Fallback chain**:
-Ordered or weighted candidate models; on failure the call advances to the next candidate. A leg counts as failed until it delivers its first chunk — an HTTP error, an error frame after a 200, a dropped connection, or a stream that ends empty all advance the chain. Once content has reached the consumer the chain is committed: a later failure surfaces as a stream error carrying the Partial output, because splicing a second model onto half an answer is worse than failing.
+Ordered or weighted candidate models; on failure the call advances to the next candidate. A leg counts as failed until it delivers its first chunk — an HTTP error, an error frame after a 200, a dropped connection, or a stream that ends empty all advance the chain. Once answer content has reached the consumer — a stream's chunks, or an `ask` handler — the chain is committed: a later failure surfaces as a stream error carrying the Partial output, because splicing a second model onto half an answer is worse than failing. Reasoning alone commits an `ask` handler to nothing; a stream commits at its first chunk of any kind.
 _Avoid_: confusing with retry.
 
 **Partial output**:
@@ -45,7 +45,7 @@ Best available identity of the model that produced a response: the ResolvedModel
 Verbatim provider string explaining why generation ended; never normalized.
 
 **Truncation**:
-An answer cut short rather than ended: the FinishReason is `length`, or a stream carried content and then ended with no FinishReason at all, having lost its terminal frame. A response with no content is the empty case, not a truncated one. `ask` treats a truncated leg as failed and advances the Fallback chain; a stream reports it, since its output has already been delivered.
+An answer cut short rather than ended: the FinishReason is `length`, or a stream carried content and then ended with no FinishReason at all, having lost its terminal frame. A response with no content is the empty case, not a truncated one. `ask` treats a truncated leg as failed and advances the Fallback chain unless its content already reached a handler; a stream reports it, since its output has already been delivered.
 
 **Request hook**:
 Per-attempt observation callback receiving usage or error; the library's only telemetry surface.
