@@ -381,11 +381,55 @@ fn parser_reports_the_model_the_server_says_answered() {
 }
 
 #[test]
-fn parser_keeps_the_first_reported_model() {
+fn parser_keeps_the_last_reported_model() {
+    // A relay that fell back after a reasoning-only leg names that leg in its
+    // early frames; the finish and usage frames name the leg that answered.
     let mut parser = SseParser::new();
-    feed_frame(&mut parser, r#"{"model":"first","choices":[{"delta":{"content":"a"}}]}"#);
-    feed_frame(&mut parser, r#"{"model":"second","choices":[{"delta":{"content":"b"}}]}"#);
-    assert_eq!(parser.resolved_model(), Some("first"));
+    feed_frame(
+        &mut parser,
+        r#"{"model":"failed","choices":[{"delta":{"reasoning_content":"a"}}]}"#,
+    );
+    feed_frame(
+        &mut parser,
+        r#"{"model":"answered","choices":[{"delta":{"content":"b"}}]}"#,
+    );
+    feed_frame(
+        &mut parser,
+        r#"{"model":"answered","choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+    );
+    feed_frame(
+        &mut parser,
+        r#"{"model":"answered","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":1}}"#,
+    );
+    feed_frame(&mut parser, r#"{"model":"keepalive","choices":[]}"#);
+    assert_eq!(parser.resolved_model(), Some("answered"));
+    assert_eq!(
+        parser.reported_usage(),
+        super::ReportedUsage {
+            prompt_tokens: Some(3),
+            completion_tokens: Some(1)
+        }
+    );
+}
+
+#[tokio::test]
+async fn stream_response_ends_with_the_model_of_the_last_frame() {
+    let mut response = collect_stream(
+        concat!(
+            r#"data: {"model":"failed","choices":[{"delta":{"reasoning_content":"hmm"}}]}"#,
+            "\n",
+            r#"data: {"model":"answered","choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}"#,
+            "\n",
+            r#"data: {"model":"answered","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":1}}"#,
+            "\n",
+            "data: [DONE]\n",
+        )
+        .as_bytes(),
+    )
+    .await;
+    while response.next().await.is_some() {}
+    assert_eq!(response.resolved_model().as_deref(), Some("answered"));
+    assert!(!response.usage().estimated);
 }
 
 #[test]

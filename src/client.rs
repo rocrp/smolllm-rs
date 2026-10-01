@@ -663,7 +663,9 @@ impl SseParser {
         self.finish_reason.as_deref()
     }
 
-    /// The server-reported model, from the first frame that names one.
+    /// The server-reported model, from the last frame that names one: a relay
+    /// that fell back names the failed leg early and the answering leg in its
+    /// finish and usage frames.
     fn resolved_model(&self) -> Option<&str> {
         self.resolved_model.as_deref()
     }
@@ -719,11 +721,12 @@ impl SseParser {
     fn parse_sse_data(&mut self, data: &str) -> Result<Option<StreamChunk>, Error> {
         let frame: SseFrame = serde_json::from_str(data)?;
 
-        if self.resolved_model.is_none() {
-            // `keepalive` is omlx's transport sentinel, not a model identity.
-            self.resolved_model = frame
-                .model
-                .filter(|model| !model.is_empty() && model != "keepalive");
+        // `keepalive` is omlx's transport sentinel, not a model identity.
+        if let Some(model) = frame
+            .model
+            .filter(|model| !model.is_empty() && model != "keepalive")
+        {
+            self.resolved_model = Some(model);
         }
 
         // Providers may split the two counts across frames, so fields merge
@@ -861,15 +864,14 @@ async fn process_sse_task(
         }
     };
     // The resolved model is published as soon as a frame names it, so a consumer
-    // can show it mid-stream rather than only after exhaustion.
+    // can show it mid-stream rather than only after exhaustion; later frames
+    // replace it, the finish frame naming the leg that answered.
     let publish_model = |parser: &SseParser| {
         let Some(model) = parser.resolved_model() else {
             return;
         };
         if let Ok(mut tail) = tail.lock() {
-            if tail.resolved_model.is_none() {
-                tail.resolved_model = Some(model.to_string());
-            }
+            tail.resolved_model = Some(model.to_string());
         }
     };
     tokio::pin!(byte_stream);
