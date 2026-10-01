@@ -1,6 +1,6 @@
 [package]
 name = "smolllm"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 description = "A tiny, ergonomic Rust client for OpenAI-compatible LLM APIs"
 license = "MIT"
