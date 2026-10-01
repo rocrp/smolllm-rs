@@ -1,5 +1,7 @@
 # AGENTS.md
 
+> **Deprecated (2026-10-01):** this crate is being retired; no further development is planned. The maintained clients are `smolllm` (Python, `../smolllm`) and `smolllm-go` (`../smolllm-go`). hntui still pins a tag of this crate.
+
 Guidance for coding agents working in this repository.
 
 ## Project Overview
